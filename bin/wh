@@ -1,0 +1,2225 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="Encodev WH CLI"
+APP_DIR="/root/wh-cli"
+BACKUP_DIR="$APP_DIR/backups"
+CREDENTIALS_DIR="$APP_DIR/sites"
+CADDY_AVAILABLE="/etc/caddy/sites-available"
+CADDY_ENABLED="/etc/caddy/sites-enabled"
+SFTP_GROUP="sftp-sites"
+DEFAULT_TIMEZONE="America/Toronto"
+DEFAULT_LOCALE="en_CA.UTF-8"
+ADMINER_DIR="/usr/share/adminer"
+ADMINER_FILE="$ADMINER_DIR/adminer.php"
+ADMINER_TMP_DIR="/var/lib/wh-cli/adminer-tmp"
+ADMINER_VERSION="5.4.2"
+ADMINER_REPO="vrana/adminer"
+ADMINER_TAG="v${ADMINER_VERSION}"
+ADMINER_ASSET="adminer-${ADMINER_VERSION}-mysql-en.php"
+ADMINER_URL="https://github.com/${ADMINER_REPO}/releases/download/${ADMINER_TAG}/${ADMINER_ASSET}"
+DB_HOST="127.0.0.1"
+WP_CLI_VERSION="2.12.0"
+WP_CLI_REPO="wp-cli/wp-cli"
+WP_CLI_TAG="v${WP_CLI_VERSION}"
+WP_CLI_ASSET="wp-cli-${WP_CLI_VERSION}.phar"
+WP_CLI_URL="https://github.com/${WP_CLI_REPO}/releases/download/${WP_CLI_TAG}/${WP_CLI_ASSET}"
+MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
+MANAGED_END="# END encodev-wh-cli managed"
+DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
+PHP_EXTENSIONS=(cli mysql curl mbstring xml zip gd intl bcmath soap imagick opcache)
+
+require_root() {
+    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+        echo "This script must be run as root."
+        exit 1
+    fi
+}
+
+pause() {
+    read -r -p "Press Enter to continue..."
+}
+
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+require_command() {
+    local command_name=$1
+
+    if ! command_exists "$command_name"; then
+        echo "Missing required command: $command_name" >&2
+        return 1
+    fi
+}
+
+ensure_app_dirs() {
+    mkdir -p "$APP_DIR" "$BACKUP_DIR" "$CREDENTIALS_DIR"
+    chmod 700 "$APP_DIR" "$BACKUP_DIR" "$CREDENTIALS_DIR"
+}
+
+prompt() {
+    local label=$1
+    local default=${2:-}
+    local value
+
+    if [[ -n "$default" ]]; then
+        printf '%s [%s]: ' "$label" "$default" >&2
+        read -r value
+        printf '%s\n' "${value:-$default}"
+    else
+        printf '%s: ' "$label" >&2
+        read -r value
+        printf '%s\n' "$value"
+    fi
+}
+
+confirm() {
+    local label=$1
+    local default=${2:-n}
+    local suffix="[y/N]"
+    local answer
+
+    [[ "$default" == "y" ]] && suffix="[Y/n]"
+    printf '%s %s ' "$label" "$suffix" >&2
+    read -r answer
+    answer=${answer:-$default}
+
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+validate_ipv4() {
+    local ip=$1
+    local part
+    local -a parts
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a parts <<< "$ip"
+    for part in "${parts[@]}"; do
+        [[ "$part" =~ ^[0-9]+$ ]] || return 1
+        (( part >= 0 && part <= 255 )) || return 1
+    done
+}
+
+validate_port() {
+    local port=$1
+    [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+validate_domain() {
+    local domain=${1,,}
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$ ]]
+}
+
+validate_username() {
+    local username=$1
+    [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
+}
+
+validate_timezone() {
+    if command_exists timedatectl && timedatectl list-timezones 2>/dev/null | grep -Fxq "$1"; then
+        return 0
+    fi
+    [[ "$1" != *".."* && -f "/usr/share/zoneinfo/$1" ]]
+}
+
+detect_hostname() {
+    local detected
+    detected=$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)
+    if [[ -z "$detected" || "$detected" == "localhost" || "$detected" != *.* ]]; then
+        detected="server.example.com"
+    fi
+    printf '%s\n' "$detected"
+}
+
+detect_ssh_client_ip() {
+    local detected=""
+    if [[ -n "${SSH_CLIENT:-}" ]]; then
+        detected=${SSH_CLIENT%% *}
+    fi
+
+    if validate_ipv4 "$detected"; then
+        printf '%s\n' "$detected"
+    else
+        printf '%s\n' "203.0.113.10"
+    fi
+}
+
+detect_ssh_port() {
+    local detected=""
+    if [[ -n "${SSH_CONNECTION:-}" ]]; then
+        read -r _ _ _ detected <<< "$SSH_CONNECTION"
+    fi
+
+    if validate_port "$detected"; then
+        printf '%s\n' "$detected"
+    else
+        printf '%s\n' "22"
+    fi
+}
+
+username_from_domain() {
+    local domain=${1,,}
+    local username
+    username=$(printf '%s' "$domain" \
+        | tr '.-' '_' \
+        | tr -cs 'a-z0-9_' '_' \
+        | sed -E 's/^_+//; s/_+$//; s/_{2,}/_/g')
+    [[ -z "$username" ]] && username="domain"
+    username="site_$username"
+    printf '%s\n' "$username" | cut -c1-31
+}
+
+db_name_from_username() {
+    printf '%s\n' "$1" | tr '-' '_' | cut -c1-48
+}
+
+random_secret() {
+    if ! command_exists openssl; then
+        echo "openssl is required to generate credentials. Run setup first." >&2
+        return 1
+    fi
+    openssl rand -hex 16
+}
+
+assert_supported_os() {
+    local os_id codename
+
+    if [[ ! -r /etc/os-release ]]; then
+        echo "Cannot detect operating system from /etc/os-release." >&2
+        return 1
+    fi
+
+    os_id=$(awk -F= '$1 == "ID" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
+    codename=$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
+
+    if [[ "$os_id" != "debian" ]]; then
+        echo "This installer currently supports Debian only. Detected: ${os_id:-unknown}" >&2
+        return 1
+    fi
+    if [[ -z "$codename" ]]; then
+        echo "Could not detect the Debian codename from /etc/os-release." >&2
+        return 1
+    fi
+}
+
+service_is_active() {
+    local service=$1
+    command_exists systemctl && systemctl is-active --quiet "$service" 2>/dev/null
+}
+
+service_is_enabled() {
+    local service=$1
+    command_exists systemctl && systemctl is-enabled --quiet "$service" 2>/dev/null
+}
+
+check_conflicting_web_servers() {
+    local service failed=0
+
+    for service in apache2 nginx; do
+        if service_is_active "$service"; then
+            echo "$service is active and may already be using ports 80/443." >&2
+            failed=1
+        elif service_is_enabled "$service"; then
+            echo "$service is enabled and may take ports 80/443 after reboot." >&2
+            failed=1
+        fi
+    done
+
+    if (( failed != 0 )); then
+        echo "Stop or migrate conflicting web servers before running setup." >&2
+        return 1
+    fi
+}
+
+preflight_setup_environment() {
+    assert_supported_os || return 1
+    require_command apt || return 1
+    require_command systemctl || return 1
+
+    if [[ ! -d /run/systemd/system ]]; then
+        echo "systemd does not appear to be running. This installer manages system services." >&2
+        return 1
+    fi
+
+    check_conflicting_web_servers
+}
+
+is_managed_file() {
+    local path=$1
+    [[ -f "$path" ]] && grep -q '^# Managed by encodev-wh-cli' "$path"
+}
+
+path_exists() {
+    [[ -e "$1" || -L "$1" ]]
+}
+
+require_managed_or_missing() {
+    local path=$1
+    local label=$2
+
+    if path_exists "$path" && ! is_managed_file "$path"; then
+        echo "$label exists and is not managed by encodev-wh-cli: $path" >&2
+        echo "Refusing to overwrite it. Move it aside or add it manually." >&2
+        return 1
+    fi
+}
+
+is_default_caddyfile() {
+    local path=$1
+    [[ -f "$path" ]] && grep -q '/usr/share/caddy' "$path" && grep -q 'file_server' "$path"
+}
+
+restore_file_from_backup() {
+    local path=$1
+    local backup
+
+    backup=$(backup_path_for "$path")
+    if path_exists "$backup"; then
+        mkdir -p "$(dirname "$path")"
+        cp -a "$backup" "$path"
+    else
+        rm -f "$path"
+    fi
+}
+
+github_release_asset_digest() {
+    local repo=$1
+    local tag=$2
+    local asset=$3
+    local api tmp digest
+
+    api="https://api.github.com/repos/$repo/releases/tags/$tag"
+    tmp=$(mktemp)
+    if ! curl -fsSL \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        -H "User-Agent: encodev-wh-cli" \
+        "$api" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    digest=$(grep -F -A80 "\"name\": \"$asset\"" "$tmp" \
+        | sed -n 's/.*"digest": "sha256:\([a-fA-F0-9]\{64\}\)".*/\1/p' \
+        | head -n 1)
+    rm -f "$tmp"
+
+    if [[ -z "$digest" ]]; then
+        echo "Could not find SHA-256 digest for $asset in $repo $tag." >&2
+        return 1
+    fi
+    printf '%s\n' "$digest"
+}
+
+download_verified_github_asset() {
+    local repo=$1
+    local tag=$2
+    local asset=$3
+    local url=$4
+    local dest=$5
+    local tmp expected actual
+
+    if ! expected=$(github_release_asset_digest "$repo" "$tag" "$asset"); then
+        return 1
+    fi
+
+    tmp=$(mktemp)
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [[ "${actual,,}" != "${expected,,}" ]]; then
+        rm -f "$tmp"
+        echo "Checksum verification failed for $asset." >&2
+        echo "Expected: $expected" >&2
+        echo "Actual:   $actual" >&2
+        return 1
+    fi
+
+    if ! install -m 0644 "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+download_url_file() {
+    local url=$1
+    local dest=$2
+    local mode=${3:-0644}
+    local tmp
+
+    tmp=$(mktemp)
+    if ! curl -fsSL "$url" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! install -m "$mode" "$tmp" "$dest"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+install_apt_keyring() {
+    local url=$1
+    local dest=$2
+    local key_tmp gpg_tmp
+
+    key_tmp=$(mktemp)
+    gpg_tmp=$(mktemp)
+    if ! curl -fsSL "$url" -o "$key_tmp"; then
+        rm -f "$key_tmp" "$gpg_tmp"
+        return 1
+    fi
+    if ! gpg --batch --yes --dearmor -o "$gpg_tmp" "$key_tmp"; then
+        rm -f "$key_tmp" "$gpg_tmp"
+        return 1
+    fi
+    if ! install -m 0644 "$gpg_tmp" "$dest"; then
+        rm -f "$key_tmp" "$gpg_tmp"
+        return 1
+    fi
+    rm -f "$key_tmp" "$gpg_tmp"
+}
+
+php_socket_ref() {
+    local php_version=$1
+    local username=$2
+    printf 'unix//run/php/php%s-fpm-%s.sock\n' "$php_version" "$username"
+}
+
+enable_caddy_config() {
+    local conf=$1
+    local enabled="$CADDY_ENABLED/$(basename "$conf")"
+
+    backup_file "$enabled"
+    ln -sfn "$conf" "$enabled"
+
+    if ! caddy validate --config /etc/caddy/Caddyfile; then
+        rm -f "$enabled"
+        restore_file_from_backup "$enabled"
+        return 1
+    fi
+
+    if ! systemctl reload caddy; then
+        rm -f "$enabled"
+        restore_file_from_backup "$enabled"
+        systemctl reload caddy || true
+        return 1
+    fi
+}
+
+start_backup_run() {
+    CURRENT_BACKUP_DIR="$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$CURRENT_BACKUP_DIR"
+    chmod 700 "$CURRENT_BACKUP_DIR"
+}
+
+backup_path_for() {
+    local path=$1
+    printf '%s%s\n' "$CURRENT_BACKUP_DIR" "$path"
+}
+
+backup_file() {
+    local path=$1
+    local dest
+
+    [[ -f "$path" || -L "$path" ]] || return 0
+    [[ -n "${CURRENT_BACKUP_DIR:-}" ]] || start_backup_run
+
+    dest=$(backup_path_for "$path")
+    mkdir -p "$(dirname "$dest")"
+    cp -a "$path" "$dest"
+}
+
+prune_backups() {
+    local old_backups
+    mapfile -t old_backups < <(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort | head -n -30)
+    if (( ${#old_backups[@]} > 0 )); then
+        rm -rf "${old_backups[@]}"
+    fi
+}
+
+write_file() {
+    local path=$1
+    local tmp
+
+    tmp=$(mktemp)
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! backup_file "$path"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! install -m 0644 "$tmp" "$path"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+service_state() {
+    local service=$1
+    if ! command_exists systemctl; then
+        printf '%s\n' "unknown"
+    elif systemctl is-active --quiet "$service" 2>/dev/null; then
+        printf '%s\n' "running"
+    elif systemctl list-unit-files "$service.service" >/dev/null 2>&1; then
+        printf '%s\n' "installed"
+    else
+        printf '%s\n' "missing"
+    fi
+}
+
+installed_php_versions() {
+    local dir
+    for dir in /etc/php/*/fpm; do
+        [[ -d "$dir" ]] || continue
+        basename "$(dirname "$dir")"
+    done | sort -Vr
+}
+
+available_php_versions() {
+    apt-cache search '^php[0-9]+\.[0-9]+-fpm$' 2>/dev/null \
+        | awk '{print $1}' \
+        | sed -E 's/^php([0-9]+\.[0-9]+)-fpm$/\1/' \
+        | sort -Vr
+}
+
+php_is_eol() {
+    local version=$1
+    local major=${version%%.*}
+    local minor=${version#*.}
+
+    (( major < 8 )) && return 0
+    (( major == 8 && minor < 2 )) && return 0
+    return 1
+}
+
+select_php_versions_to_install() {
+    local versions=()
+    local choices
+    local default_index=0
+    local i version label index exists
+
+    mapfile -t versions < <(available_php_versions)
+    if (( ${#versions[@]} == 0 )); then
+        versions=(8.4 8.3 8.2 8.1 7.4 5.6)
+    fi
+
+    echo >&2
+    echo "Select PHP-FPM version(s) to install:" >&2
+    for i in "${!versions[@]}"; do
+        version=${versions[$i]}
+        label="PHP $version"
+        php_is_eol "$version" && label="$label (EOL)"
+        printf '  %d. %s\n' "$((i + 1))" "$label" >&2
+        if ! php_is_eol "$version" && [[ $default_index -eq 0 ]]; then
+            default_index=$((i + 1))
+        fi
+    done
+    [[ $default_index -eq 0 ]] && default_index=1
+
+    printf 'Enter one or more numbers [%s]: ' "$default_index" >&2
+    read -r choices
+    choices=${choices:-$default_index}
+    choices=${choices//,/ }
+
+    SELECTED_PHP_VERSIONS=()
+    for index in $choices; do
+        [[ "$index" =~ ^[0-9]+$ ]] || continue
+        (( index >= 1 && index <= ${#versions[@]} )) || continue
+        exists=0
+        for version in "${SELECTED_PHP_VERSIONS[@]}"; do
+            [[ "$version" == "${versions[$((index - 1))]}" ]] && exists=1
+        done
+        (( exists == 0 )) && SELECTED_PHP_VERSIONS+=("${versions[$((index - 1))]}")
+    done
+
+    if (( ${#SELECTED_PHP_VERSIONS[@]} == 0 )); then
+        SELECTED_PHP_VERSIONS=("${versions[$((default_index - 1))]}")
+    fi
+
+    printf 'Selected PHP versions: %s\n' "${SELECTED_PHP_VERSIONS[*]}" >&2
+}
+
+select_installed_php_version() {
+    local versions=()
+    local i selected
+
+    mapfile -t versions < <(installed_php_versions)
+    if (( ${#versions[@]} == 0 )); then
+        echo "No PHP-FPM versions are installed. Run setup first." >&2
+        return 1
+    fi
+
+    echo >&2
+    echo "Installed PHP-FPM versions:" >&2
+    for i in "${!versions[@]}"; do
+        printf '  %d. PHP %s\n' "$((i + 1))" "${versions[$i]}" >&2
+    done
+
+    printf 'Select PHP version [1]: ' >&2
+    read -r selected
+    selected=${selected:-1}
+    [[ "$selected" =~ ^[0-9]+$ ]] || selected=1
+    (( selected >= 1 && selected <= ${#versions[@]} )) || selected=1
+    printf '%s\n' "${versions[$((selected - 1))]}"
+}
+
+prepare_repositories() {
+    local codename
+    codename=$(. /etc/os-release && printf '%s\n' "$VERSION_CODENAME")
+
+    apt update
+    apt install -y ca-certificates curl gnupg debian-keyring debian-archive-keyring apt-transport-https lsb-release
+
+    if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
+        install_apt_keyring \
+            https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
+            /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    fi
+    if [[ ! -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
+        download_url_file \
+            https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
+            /etc/apt/sources.list.d/caddy-stable.list
+    fi
+
+    if [[ ! -f /usr/share/keyrings/deb.sury.org-php.gpg ]]; then
+        install_apt_keyring \
+            https://packages.sury.org/php/apt.gpg \
+            /usr/share/keyrings/deb.sury.org-php.gpg
+    fi
+    write_file /etc/apt/sources.list.d/php-sury.list <<EOF
+deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ $codename main
+EOF
+
+    apt update
+}
+
+install_php_versions() {
+    local version ext packages=()
+
+    for version in "${SELECTED_PHP_VERSIONS[@]}"; do
+        packages+=("php$version-fpm")
+        for ext in "${PHP_EXTENSIONS[@]}"; do
+            packages+=("php$version-$ext")
+        done
+    done
+
+    apt install -y "${packages[@]}"
+    for version in "${SELECTED_PHP_VERSIONS[@]}"; do
+        systemctl enable "php$version-fpm" --now
+    done
+}
+
+configure_caddy_base() {
+    mkdir -p "$CADDY_AVAILABLE" "$CADDY_ENABLED"
+    if path_exists /etc/caddy/Caddyfile \
+        && ! is_managed_file /etc/caddy/Caddyfile \
+        && ! is_default_caddyfile /etc/caddy/Caddyfile; then
+        echo "/etc/caddy/Caddyfile exists and is not managed by encodev-wh-cli." >&2
+        echo "Refusing to overwrite it. Move it aside or migrate it manually." >&2
+        return 1
+    fi
+    write_file /etc/caddy/Caddyfile <<EOF
+# Managed by encodev-wh-cli
+import $CADDY_ENABLED/*
+EOF
+}
+
+configure_timezone_and_locales() {
+    local timezone=$1
+
+    timedatectl set-timezone "$timezone"
+    apt install -y locales
+    backup_file /etc/locale.gen
+
+    grep -q '^en_CA.UTF-8 UTF-8' /etc/locale.gen \
+        || sed -i -E 's/^# ?(en_CA.UTF-8 UTF-8)/\1/' /etc/locale.gen
+    grep -q '^fr_CA.UTF-8 UTF-8' /etc/locale.gen \
+        || sed -i -E 's/^# ?(fr_CA.UTF-8 UTF-8)/\1/' /etc/locale.gen
+    grep -q '^en_CA.UTF-8 UTF-8' /etc/locale.gen || echo 'en_CA.UTF-8 UTF-8' >> /etc/locale.gen
+    grep -q '^fr_CA.UTF-8 UTF-8' /etc/locale.gen || echo 'fr_CA.UTF-8 UTF-8' >> /etc/locale.gen
+
+    locale-gen en_CA.UTF-8 fr_CA.UTF-8
+    update-locale "LANG=$DEFAULT_LOCALE"
+}
+
+configure_ufw() {
+    local admin_ip=$1
+    local ssh_port=$2
+
+    backup_file /etc/ufw/user.rules
+    backup_file /etc/ufw/user6.rules
+
+    ufw --force reset
+    ufw default deny incoming
+    ufw default allow outgoing
+    ufw allow from "$admin_ip" to any port "$ssh_port" proto tcp comment 'encodev admin ssh'
+    ufw allow 80/tcp comment 'encodev http'
+    ufw allow 443/tcp comment 'encodev https'
+    ufw --force enable
+}
+
+configure_fail2ban() {
+    local ssh_port=$1
+
+    apt install -y fail2ban
+    mkdir -p /etc/fail2ban/jail.d
+    write_file /etc/fail2ban/jail.d/encodev-wh-cli.conf <<EOF
+[sshd]
+enabled = true
+port = $ssh_port
+maxretry = 5
+findtime = 10m
+bantime = 1h
+EOF
+    systemctl enable fail2ban --now
+    systemctl restart fail2ban
+}
+
+ssh_config_has_active_match() {
+    local config=$1
+    local pattern file
+
+    grep -Eq '^[[:space:]]*Match[[:space:]]+' "$config" && return 0
+
+    while read -r pattern; do
+        [[ -n "$pattern" ]] || continue
+        [[ "$pattern" == /* ]] || pattern="/etc/ssh/$pattern"
+        for file in $pattern; do
+            [[ -f "$file" ]] || continue
+            grep -Eq '^[[:space:]]*Match[[:space:]]+' "$file" && return 0
+        done
+    done < <(awk '/^[[:space:]]*Include[[:space:]]+/ { for (i = 2; i <= NF; i++) print $i }' "$config")
+
+    return 1
+}
+
+configure_sshd() {
+    local config=/etc/ssh/sshd_config
+    local hardening_dropin=/etc/ssh/sshd_config.d/00-encodev-wh-cli.conf
+    local tmp
+
+    backup_file "$config"
+    tmp=$(mktemp)
+
+    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
+        $0 == begin { skip = 1; next }
+        $0 == end { skip = 0; next }
+        !skip { print }
+    ' "$config" > "$tmp"
+
+    if ssh_config_has_active_match "$tmp"; then
+        echo "$config or an included SSH config contains an unmanaged Match block." >&2
+        echo "Refusing to rewrite SSH config automatically." >&2
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if grep -Eq '^[#[:space:]]*PermitRootLogin[[:space:]]+' "$tmp"; then
+        sed -i -E 's/^[#[:space:]]*PermitRootLogin[[:space:]]+.*/PermitRootLogin no/' "$tmp"
+    else
+        printf '\nPermitRootLogin no\n' >> "$tmp"
+    fi
+
+    if grep -Eq '^[#[:space:]]*PasswordAuthentication[[:space:]]+' "$tmp"; then
+        sed -i -E 's/^[#[:space:]]*PasswordAuthentication[[:space:]]+.*/PasswordAuthentication yes/' "$tmp"
+    else
+        printf 'PasswordAuthentication yes\n' >> "$tmp"
+    fi
+
+    if grep -Eq '^[#[:space:]]*KbdInteractiveAuthentication[[:space:]]+' "$tmp"; then
+        sed -i -E 's/^[#[:space:]]*KbdInteractiveAuthentication[[:space:]]+.*/KbdInteractiveAuthentication no/' "$tmp"
+    else
+        printf 'KbdInteractiveAuthentication no\n' >> "$tmp"
+    fi
+
+    cat >> "$tmp" <<EOF
+
+$MANAGED_BEGIN
+Match Group $SFTP_GROUP
+    PasswordAuthentication yes
+    KbdInteractiveAuthentication no
+    ChrootDirectory %h
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTunnel no
+$MANAGED_END
+EOF
+
+    mkdir -p /etc/ssh/sshd_config.d
+    if ! write_file "$hardening_dropin" <<EOF
+# Managed by encodev-wh-cli
+PermitRootLogin no
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+EOF
+    then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! sshd -t -f "$tmp"; then
+        restore_file_from_backup "$hardening_dropin"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! install -m 0644 "$tmp" "$config"; then
+        restore_file_from_backup "$hardening_dropin"
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! systemctl reload ssh && ! systemctl reload sshd; then
+        restore_file_from_backup "$config"
+        restore_file_from_backup "$hardening_dropin"
+        systemctl reload ssh || systemctl reload sshd || true
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+secure_mariadb() {
+    systemctl enable mariadb --now
+    mysql -uroot <<'SQL'
+DELETE FROM mysql.user WHERE User='';
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+FLUSH PRIVILEGES;
+SQL
+}
+
+install_wp_cli() {
+    download_verified_github_asset "$WP_CLI_REPO" "$WP_CLI_TAG" "$WP_CLI_ASSET" "$WP_CLI_URL" /usr/local/bin/wp
+    chmod +x /usr/local/bin/wp
+    wp --info --allow-root >/dev/null
+}
+
+create_adminer_pool() {
+    local php_version=$1
+    local user=wwwadminer
+    local pool="/etc/php/$php_version/fpm/pool.d/encodev-adminer.conf"
+
+    if ! id "$user" >/dev/null 2>&1; then
+        useradd -r -U -d "$ADMINER_DIR" -s /usr/sbin/nologin "$user" || return 1
+    fi
+
+    mkdir -p /var/log/wh-cli || return 1
+    touch /var/log/wh-cli/adminer-php-error.log || return 1
+    chown "$user:$user" /var/log/wh-cli/adminer-php-error.log || return 1
+    chmod 640 /var/log/wh-cli/adminer-php-error.log || return 1
+    mkdir -p "$ADMINER_TMP_DIR" || return 1
+    chown "$user:$user" "$ADMINER_TMP_DIR" || return 1
+    chmod 700 "$ADMINER_TMP_DIR" || return 1
+
+    write_file "$pool" <<EOF
+; Managed by encodev-wh-cli
+[encodev-adminer]
+user = $user
+group = $user
+listen = /run/php/php$php_version-fpm-adminer.sock
+listen.owner = caddy
+listen.group = caddy
+listen.mode = 0660
+pm = ondemand
+pm.max_children = 3
+pm.process_idle_timeout = 10s
+php_admin_value[open_basedir] = $ADMINER_DIR:$ADMINER_TMP_DIR
+php_admin_value[upload_tmp_dir] = $ADMINER_TMP_DIR
+php_admin_value[session.save_path] = $ADMINER_TMP_DIR
+php_admin_value[sys_temp_dir] = $ADMINER_TMP_DIR
+php_admin_value[error_log] = /var/log/wh-cli/adminer-php-error.log
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = off
+php_admin_flag[expose_php] = off
+php_admin_value[cgi.fix_pathinfo] = 0
+php_admin_value[disable_functions] = $DISABLED_PHP_FUNCTIONS
+EOF
+
+    systemctl restart "php$php_version-fpm"
+}
+
+install_adminer() {
+    local admin_host=$1
+    local admin_ip=$2
+    local php_version=$3
+    local conf="$CADDY_AVAILABLE/_admin-$admin_host"
+
+    if path_exists "$conf" && ! is_managed_file "$conf"; then
+        echo "Admin Caddy config exists and is not managed: $conf" >&2
+        return 1
+    fi
+
+    mkdir -p "$ADMINER_DIR" || return 1
+    download_verified_github_asset "$ADMINER_REPO" "$ADMINER_TAG" "$ADMINER_ASSET" "$ADMINER_URL" "$ADMINER_FILE" || return 1
+    chown -R root:root "$ADMINER_DIR" || return 1
+    chmod 755 "$ADMINER_DIR" || return 1
+    chmod 644 "$ADMINER_FILE" || return 1
+
+    create_adminer_pool "$php_version" || return 1
+
+    write_file "$conf" <<EOF
+# Managed by encodev-wh-cli
+# domain: $admin_host
+# type: admin
+# user: wwwadminer
+# php: $php_version
+# webroot: $ADMINER_DIR
+
+$admin_host {
+    @adminer_allowed {
+        path /dba /dba/*
+        remote_ip $admin_ip
+    }
+    @adminer path /dba /dba/*
+
+    header {
+        X-Content-Type-Options nosniff
+        X-Robots-Tag "noindex, nofollow"
+        Referrer-Policy no-referrer
+    }
+
+    handle @adminer_allowed {
+        uri strip_prefix /dba
+        root * $ADMINER_DIR
+        rewrite * /adminer.php
+        php_fastcgi unix//run/php/php$php_version-fpm-adminer.sock
+    }
+
+    respond @adminer "Forbidden" 403
+    respond "Not Found" 404
+}
+EOF
+
+    enable_caddy_config "$conf"
+}
+
+install_base_packages() {
+    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server
+    systemctl enable caddy --now
+}
+
+setup_server() {
+    local admin_host admin_ip ssh_port timezone primary_php
+
+    ensure_app_dirs
+    preflight_setup_environment || return 1
+
+    admin_host=$(prompt "Public admin host for /dba" "$(detect_hostname)")
+    while ! validate_domain "$admin_host"; do
+        echo "Enter a valid hostname, for example server.example.com."
+        admin_host=$(prompt "Public admin host for /dba" "$admin_host")
+    done
+
+    admin_ip=$(prompt "Admin IPv4 allowed for SSH and /dba" "$(detect_ssh_client_ip)")
+    while ! validate_ipv4 "$admin_ip"; do
+        echo "Enter a valid IPv4 address."
+        admin_ip=$(prompt "Admin IPv4 allowed for SSH and /dba" "$admin_ip")
+    done
+
+    ssh_port=$(prompt "Current SSH port" "$(detect_ssh_port)")
+    while ! validate_port "$ssh_port"; do
+        echo "Enter a valid TCP port from 1 to 65535."
+        ssh_port=$(prompt "Current SSH port" "$ssh_port")
+    done
+
+    timezone=$(prompt "Server timezone" "$DEFAULT_TIMEZONE")
+    while ! validate_timezone "$timezone"; do
+        echo "Unknown timezone."
+        timezone=$(prompt "Server timezone" "$DEFAULT_TIMEZONE")
+    done
+
+    if path_exists /etc/caddy/Caddyfile \
+        && ! is_managed_file /etc/caddy/Caddyfile \
+        && ! is_default_caddyfile /etc/caddy/Caddyfile; then
+        echo "/etc/caddy/Caddyfile exists and is not managed by encodev-wh-cli." >&2
+        echo "Refusing to overwrite it. Move it aside or migrate it manually." >&2
+        return 0
+    fi
+
+    echo
+    echo "Setup summary"
+    echo "  Admin host:      $admin_host"
+    echo "  Admin IPv4:      $admin_ip"
+    echo "  SSH port:        $ssh_port"
+    echo "  SSH password:    enabled for non-root users"
+    echo "  Timezone:        $timezone"
+    echo "  Locales:         en_CA.UTF-8, fr_CA.UTF-8"
+    echo "  Default locale:  $DEFAULT_LOCALE"
+    echo "  PHP versions:    choose after repositories are prepared"
+    echo "  MariaDB:         install and harden with root socket auth"
+    echo "  Caddy:           install and use sites-enabled imports"
+    echo "  UFW:             SSH port $ssh_port from $admin_ip only, public 80/443"
+    echo "  Fail2ban:        SSH jail"
+    echo "  Adminer:         https://$admin_host/dba, IP restricted"
+    echo "  Backups:         $BACKUP_DIR/<timestamp>"
+    echo
+
+    if ! confirm "Apply setup changes?" "n"; then
+        return 0
+    fi
+
+    start_backup_run
+    prepare_repositories
+    select_php_versions_to_install
+    primary_php=${SELECTED_PHP_VERSIONS[0]}
+
+    install_base_packages
+    install_php_versions
+    configure_timezone_and_locales "$timezone"
+    configure_caddy_base
+    groupadd -f "$SFTP_GROUP"
+    configure_sshd
+    configure_fail2ban "$ssh_port"
+    secure_mariadb
+    install_wp_cli
+    install_adminer "$admin_host" "$admin_ip" "$primary_php"
+    caddy validate --config /etc/caddy/Caddyfile
+    systemctl reload caddy
+    configure_ufw "$admin_ip" "$ssh_port"
+    prune_backups
+
+    echo
+    echo "Setup complete."
+    echo "Adminer: https://$admin_host/dba"
+    echo "Backup:  $CURRENT_BACKUP_DIR"
+}
+
+install_php_versions_menu() {
+    ensure_app_dirs
+    assert_supported_os || return 1
+    require_command apt || return 1
+    require_command systemctl || return 1
+    if [[ ! -d /run/systemd/system ]]; then
+        echo "systemd does not appear to be running. PHP-FPM services cannot be managed." >&2
+        return 1
+    fi
+
+    echo
+    echo "Install additional PHP-FPM versions"
+    echo "This prepares the Caddy/Sury repositories and installs selected PHP-FPM packages."
+    echo
+
+    if ! confirm "Continue?" "y"; then
+        return 0
+    fi
+
+    start_backup_run
+    prepare_repositories
+    select_php_versions_to_install
+    install_php_versions
+    prune_backups
+
+    echo "Installed PHP versions: ${SELECTED_PHP_VERSIONS[*]}"
+    echo "Backup: $CURRENT_BACKUP_DIR"
+}
+
+site_type_prompt() {
+    local choice
+    echo >&2
+    echo "Site type:" >&2
+    echo "  1. WordPress" >&2
+    echo "  2. Custom PHP" >&2
+    echo "  3. Static" >&2
+    printf 'Select type [1]: ' >&2
+    read -r choice
+    case "${choice:-1}" in
+        1) printf '%s\n' "wordpress" ;;
+        2) printf '%s\n' "php" ;;
+        3) printf '%s\n' "static" ;;
+        *) printf '%s\n' "wordpress" ;;
+    esac
+}
+
+is_apex_like_domain() {
+    local domain=$1
+    [[ $(grep -o '\.' <<< "$domain" | wc -l) -eq 1 ]]
+}
+
+www_policy_prompt() {
+    local domain=$1
+    local choice
+
+    if ! is_apex_like_domain "$domain"; then
+        printf '%s\n' "none"
+        return 0
+    fi
+
+    echo >&2
+    echo "WWW alias for $domain:" >&2
+    echo "  1. Redirect www.$domain to $domain" >&2
+    echo "  2. Redirect $domain to www.$domain" >&2
+    echo "  3. Serve both names" >&2
+    echo "  4. Do not configure www" >&2
+    printf 'Select www behavior [1]: ' >&2
+    read -r choice
+
+    case "${choice:-1}" in
+        1) printf '%s\n' "redirect_www" ;;
+        2) printf '%s\n' "redirect_apex" ;;
+        3) printf '%s\n' "serve_both" ;;
+        4) printf '%s\n' "none" ;;
+        *) printf '%s\n' "redirect_www" ;;
+    esac
+}
+
+www_policy_label() {
+    local domain=$1
+    local policy=$2
+
+    case "$policy" in
+        redirect_www) printf 'www.%s -> %s\n' "$domain" "$domain" ;;
+        redirect_apex) printf '%s -> www.%s\n' "$domain" "$domain" ;;
+        serve_both) printf '%s and www.%s\n' "$domain" "$domain" ;;
+        *) printf '%s\n' "none" ;;
+    esac
+}
+
+create_site_user() {
+    local username=$1
+    local home=$2
+    local password=$3
+
+    groupadd -f "$SFTP_GROUP"
+    if ! id "$username" >/dev/null 2>&1; then
+        useradd -U -d "$home" -s /usr/sbin/nologin -G "$SFTP_GROUP" "$username" || return 1
+    fi
+
+    printf '%s:%s\n' "$username" "$password" | chpasswd || return 1
+
+    mkdir -p "$home/public_html" "$home/logs" "$home/tmp" || return 1
+    chown root:root "$home" || return 1
+    chmod 755 "$home" || return 1
+    chown "$username:$username" "$home/public_html" "$home/tmp" || return 1
+    chmod 755 "$home/public_html" || return 1
+    chmod 700 "$home/tmp" || return 1
+
+    chown root:root "$home/logs" || return 1
+    chmod 755 "$home/logs" || return 1
+}
+
+prepare_logs() {
+    local username=$1
+    local home=$2
+
+    touch "$home/logs/access.log" "$home/logs/error.log" "$home/logs/php-error.log" || return 1
+    if id caddy >/dev/null 2>&1; then
+        chown "caddy:$username" "$home/logs/access.log" "$home/logs/error.log" || return 1
+    fi
+    chown "$username:$username" "$home/logs/php-error.log" || return 1
+    chmod 640 "$home/logs/access.log" "$home/logs/error.log" "$home/logs/php-error.log" || return 1
+}
+
+webroot_is_empty() {
+    local webroot=$1
+
+    [[ -d "$webroot" ]] || return 1
+    [[ -z "$(find "$webroot" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]
+}
+
+download_wordpress_core() {
+    local username=$1
+    local home=$2
+    local webroot="$home/public_html"
+    local wp_home="$home/tmp"
+    local wp_cache="$wp_home/wp-cli-cache"
+
+    if ! command_exists wp; then
+        echo "WP-CLI is not installed. Run setup first or skip WordPress download." >&2
+        return 1
+    fi
+    if ! webroot_is_empty "$webroot"; then
+        echo "$webroot is not empty. Refusing to download WordPress over existing files." >&2
+        return 1
+    fi
+
+    prepare_wp_cli_runtime "$username" "$home" || return 1
+
+    runuser -u "$username" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp core download --path="$webroot"
+}
+
+prepare_wp_cli_runtime() {
+    local username=$1
+    local home=$2
+    local wp_home="$home/tmp"
+    local wp_cache="$wp_home/wp-cli-cache"
+
+    [[ "$home" == "/home/$username" ]] || return 1
+    mkdir -p "$wp_cache" || return 1
+    chown "$username:$username" "$wp_home" || return 1
+    chown -R "$username:$username" "$wp_cache" || return 1
+    chmod 700 "$wp_home" "$wp_cache" || return 1
+}
+
+fix_site_permissions() {
+    local username=$1
+    local home=$2
+    local webroot="$home/public_html"
+
+    [[ "$home" == "/home/$username" ]] || return 1
+    [[ -d "$webroot" ]] || return 1
+
+    chown root:root "$home" || return 1
+    chmod 755 "$home" || return 1
+
+    chown -R "$username:$username" "$webroot" || return 1
+    find "$webroot" -type d -exec chmod 755 {} + || return 1
+    find "$webroot" -type f -exec chmod 644 {} + || return 1
+
+    chown "$username:$username" "$home/tmp" || return 1
+    chmod 700 "$home/tmp" || return 1
+
+    chown root:root "$home/logs" || return 1
+    chmod 755 "$home/logs" || return 1
+    prepare_logs "$username" "$home"
+}
+
+create_php_pool() {
+    local username=$1
+    local home=$2
+    local php_version=$3
+    local pool="/etc/php/$php_version/fpm/pool.d/encodev-$username.conf"
+
+    write_file "$pool" <<EOF
+; Managed by encodev-wh-cli
+[encodev-$username]
+user = $username
+group = $username
+listen = /run/php/php$php_version-fpm-$username.sock
+listen.owner = caddy
+listen.group = caddy
+listen.mode = 0660
+pm = dynamic
+pm.max_children = 10
+pm.start_servers = 2
+pm.min_spare_servers = 1
+pm.max_spare_servers = 3
+chdir = /
+php_admin_value[open_basedir] = $home/public_html:$home/tmp
+php_admin_value[upload_tmp_dir] = $home/tmp
+php_admin_value[session.save_path] = $home/tmp
+php_admin_value[sys_temp_dir] = $home/tmp
+php_admin_value[error_log] = $home/logs/php-error.log
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = off
+php_admin_flag[expose_php] = off
+php_admin_value[cgi.fix_pathinfo] = 0
+php_admin_value[disable_functions] = $DISABLED_PHP_FUNCTIONS
+EOF
+}
+
+create_database() {
+    local db_name=$1
+    local db_user=$2
+    local db_pass=$3
+
+    mysql -uroot <<SQL
+CREATE DATABASE \`$db_name\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER '$db_user'@'localhost' IDENTIFIED BY '$db_pass';
+CREATE USER '$db_user'@'$DB_HOST' IDENTIFIED BY '$db_pass';
+GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'localhost';
+GRANT ALL PRIVILEGES ON \`$db_name\`.* TO '$db_user'@'$DB_HOST';
+FLUSH PRIVILEGES;
+SQL
+}
+
+mysql_available() {
+    mysql -uroot -NBe "SELECT 1" >/dev/null 2>&1
+}
+
+mysql_database_exists() {
+    local db_name=$1
+    local result
+
+    result=$(mysql -uroot -NBe "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '$db_name' LIMIT 1" 2>/dev/null || true)
+    [[ "$result" == "$db_name" ]]
+}
+
+mysql_user_exists() {
+    local db_user=$1
+    local result
+
+    result=$(mysql -uroot -NBe "SELECT User FROM mysql.user WHERE User = '$db_user' AND Host IN ('localhost', '$DB_HOST') LIMIT 1" 2>/dev/null || true)
+    [[ "$result" == "$db_user" ]]
+}
+
+ensure_site_can_be_created() {
+    local domain=$1
+    local type=$2
+    local username=$3
+    local home=$4
+    local php_version=$5
+    local create_db=$6
+    local db_name=$7
+    local db_user=$8
+    local conf="$CADDY_AVAILABLE/$domain"
+    local enabled="$CADDY_ENABLED/$domain"
+    local pool
+    local failed=0
+
+    if path_exists "$conf"; then
+        echo "Site config already exists: $conf" >&2
+        failed=1
+    fi
+    if path_exists "$enabled"; then
+        echo "Enabled site entry already exists: $enabled" >&2
+        failed=1
+    fi
+    if path_exists "$CREDENTIALS_DIR/$domain.txt"; then
+        echo "Credentials file already exists: $CREDENTIALS_DIR/$domain.txt" >&2
+        failed=1
+    fi
+    if id "$username" >/dev/null 2>&1; then
+        echo "Linux user already exists: $username" >&2
+        failed=1
+    fi
+    if path_exists "$home"; then
+        echo "Home directory already exists: $home" >&2
+        failed=1
+    fi
+
+    if [[ "$type" != "static" ]]; then
+        pool=$(pool_path_for "$php_version" "$username")
+        if path_exists "$pool" || path_exists "$pool.disabled"; then
+            echo "PHP-FPM pool already exists for $username on PHP $php_version." >&2
+            failed=1
+        fi
+    fi
+
+    if [[ "$create_db" == "y" ]]; then
+        if ! mysql_available; then
+            echo "MariaDB root socket access is not available. Run setup first." >&2
+            failed=1
+        else
+            if mysql_database_exists "$db_name"; then
+                echo "Database already exists: $db_name" >&2
+                failed=1
+            fi
+            if mysql_user_exists "$db_user"; then
+                echo "Database user already exists: $db_user@localhost or $db_user@$DB_HOST" >&2
+                failed=1
+            fi
+        fi
+    fi
+
+    (( failed == 0 ))
+}
+
+rollback_add_site() {
+    local domain=$1
+    local type=$2
+    local username=$3
+    local home=$4
+    local php_version=$5
+    local create_db=$6
+    local db_name=$7
+    local db_user=$8
+    local conf="$CADDY_AVAILABLE/$domain"
+    local enabled="$CADDY_ENABLED/$domain"
+    local pool
+
+    echo "Rolling back generated resources for $domain." >&2
+    rm -f "$enabled"
+    restore_file_from_backup "$conf"
+    rm -f "$CREDENTIALS_DIR/$domain.txt"
+
+    if [[ "$type" != "static" ]]; then
+        pool=$(pool_path_for "$php_version" "$username")
+        rm -f "$pool" "$pool.disabled"
+        systemctl restart "php${php_version}-fpm" || true
+    fi
+
+    if [[ "$create_db" == "y" ]] && mysql_available; then
+        mysql -uroot <<SQL || true
+DROP USER IF EXISTS '$db_user'@'localhost';
+DROP USER IF EXISTS '$db_user'@'$DB_HOST';
+DROP DATABASE IF EXISTS \`$db_name\`;
+FLUSH PRIVILEGES;
+SQL
+    fi
+
+    if id "$username" >/dev/null 2>&1; then
+        userdel -r "$username" 2>/dev/null || true
+    fi
+    if [[ -n "$username" && "$home" == "/home/$username" ]]; then
+        rm -rf "$home"
+    fi
+}
+
+create_caddy_site() {
+    local domain=$1
+    local type=$2
+    local username=$3
+    local home=$4
+    local php_version=$5
+    local www_policy=${6:-none}
+    local conf="$CADDY_AVAILABLE/$domain"
+    local alias_block=""
+    local site_address="$domain"
+    local managed_block
+
+    if path_exists "$conf" || path_exists "$CADDY_ENABLED/$(basename "$conf")"; then
+        echo "Refusing to overwrite existing site config for $domain." >&2
+        return 1
+    fi
+
+    if ! is_apex_like_domain "$domain"; then
+        www_policy="none"
+    fi
+
+    case "$www_policy" in
+        redirect_www)
+            alias_block="www.$domain {
+    redir https://$domain{uri} permanent
+}
+
+"
+            ;;
+        redirect_apex)
+            alias_block="$domain {
+    redir https://www.$domain{uri} permanent
+}
+
+"
+            site_address="www.$domain"
+            ;;
+        serve_both)
+            site_address="$domain, www.$domain"
+            ;;
+    esac
+
+    if [[ "$type" == "static" ]]; then
+        managed_block="    $MANAGED_BEGIN
+    @sensitive_paths {
+        path /.git* /.svn* /.hg* /.env* /composer.json /composer.lock /package.json /package-lock.json /yarn.lock /pnpm-lock.yaml /wp-config.php /*.sql /*.bak /*.backup /*.old
+    }
+    respond @sensitive_paths \"Not Found\" 404
+    file_server
+    $MANAGED_END"
+    else
+        managed_block="    $MANAGED_BEGIN
+    @sensitive_paths {
+        path /.git* /.svn* /.hg* /.env* /composer.json /composer.lock /package.json /package-lock.json /yarn.lock /pnpm-lock.yaml /wp-config.php /*.sql /*.bak /*.backup /*.old
+    }
+    respond @sensitive_paths \"Not Found\" 404
+    @blocked_php_uploads {
+        path_regexp blocked_php ^/(wp-content/uploads|uploads|data|cache)/.*\\.php$
+    }
+    respond @blocked_php_uploads \"Forbidden\" 403
+    try_files {path} {path}/ /index.php?{query}
+    php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
+    file_server
+    $MANAGED_END"
+    fi
+
+    write_file "$conf" <<EOF
+# Managed by encodev-wh-cli
+# domain: $domain
+# type: $type
+# user: $username
+# php: ${php_version:--}
+# www: $www_policy
+# webroot: $home/public_html
+
+$alias_block$site_address {
+    root * $home/public_html
+    encode zstd gzip
+
+    header {
+        X-Content-Type-Options nosniff
+        Referrer-Policy strict-origin-when-cross-origin
+        X-Frame-Options SAMEORIGIN
+    }
+
+    log {
+        output file $home/logs/access.log
+    }
+
+$managed_block
+}
+EOF
+
+}
+
+save_site_credentials() {
+    local domain=$1
+    local type=$2
+    local username=$3
+    local home=$4
+    local sftp_password=$5
+    local php_version=$6
+    local www_policy=$7
+    local wp_status=$8
+    local db_name=$9
+    local db_user=${10}
+    local db_pass=${11}
+    local db_host="-"
+    local file="$CREDENTIALS_DIR/$domain.txt"
+    local old_umask
+
+    if [[ "$db_name" != "-" ]]; then
+        db_host="$DB_HOST"
+    fi
+
+    old_umask=$(umask)
+    umask 077
+    if ! cat > "$file" <<EOF
+Domain: $domain
+Type: $type
+System user: $username
+SFTP user: $username
+SFTP password: $sftp_password
+Home: $home
+Web root: $home/public_html
+Logs: $home/logs
+PHP version: ${php_version:--}
+WWW policy: $(www_policy_label "$domain" "$www_policy")
+WordPress files: $wp_status
+Caddy config: $CADDY_AVAILABLE/$domain
+Database host: $db_host
+Database name: ${db_name:--}
+Database user: ${db_user:--}
+Database password: ${db_pass:--}
+Created at: $(date -Is)
+EOF
+    then
+        umask "$old_umask"
+        return 1
+    fi
+    umask "$old_umask"
+    chmod 600 "$file"
+}
+
+update_site_credentials_php_version() {
+    local domain=$1
+    local php_version=$2
+    local file="$CREDENTIALS_DIR/$domain.txt"
+    local tmp
+
+    [[ -f "$file" ]] || return 0
+    backup_file "$file" || return 1
+    tmp=$(mktemp)
+    if ! sed -E "s/^PHP version: .*/PHP version: $php_version/" "$file" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! install -m 0600 "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+add_site() {
+    local domain type username default_username home php_version="-"
+    local create_db="n" db_name="-" db_user="-" db_pass="-"
+    local sftp_password www_policy download_wp="n" wp_status="skipped"
+
+    ensure_app_dirs
+
+    domain=$(prompt "Domain")
+    domain=${domain,,}
+    while ! validate_domain "$domain"; do
+        echo "Enter a valid domain, for example example.com or app.example.com."
+        domain=$(prompt "Domain")
+        domain=${domain,,}
+    done
+
+    www_policy=$(www_policy_prompt "$domain")
+    type=$(site_type_prompt)
+    default_username=$(username_from_domain "$domain")
+    username=$(prompt "Site username" "$default_username")
+    username=${username,,}
+    while ! validate_username "$username"; do
+        echo "Use a Linux-safe username: lowercase letters, numbers, underscore, or dash."
+        username=$(prompt "Site username" "$default_username")
+        username=${username,,}
+    done
+
+    home="/home/$username"
+    if [[ "$type" != "static" ]]; then
+        php_version=$(select_installed_php_version) || return 0
+    fi
+
+    if [[ "$type" == "wordpress" ]]; then
+        create_db="y"
+        if confirm "Download latest WordPress into public_html?" "y"; then
+            download_wp="y"
+        fi
+    elif [[ "$type" == "php" ]] && confirm "Create a MariaDB database?" "y"; then
+        create_db="y"
+    fi
+
+    sftp_password=$(random_secret) || return 1
+    if [[ "$create_db" == "y" ]]; then
+        db_name=$(db_name_from_username "$username")
+        db_user="$db_name"
+        db_pass=$(random_secret) || return 1
+    fi
+
+    if ! ensure_site_can_be_created "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"; then
+        echo "Site creation stopped because of the conflicts above."
+        return 0
+    fi
+
+    echo
+    echo "Site summary"
+    echo "  Domain:      $domain"
+    echo "  Type:        $type"
+    echo "  User:        $username"
+    echo "  Home:        $home"
+    echo "  Web root:    $home/public_html"
+    echo "  PHP:         $php_version"
+    echo "  Database:    $create_db"
+    echo "  WordPress:   $download_wp"
+    echo "  WWW:         $(www_policy_label "$domain" "$www_policy")"
+    echo
+
+    if ! confirm "Create and enable this site?" "n"; then
+        return 0
+    fi
+
+    start_backup_run
+    if ! create_site_user "$username" "$home" "$sftp_password"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if ! prepare_logs "$username" "$home"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if [[ "$type" != "static" ]] && ! create_php_pool "$username" "$home" "$php_version"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if [[ "$create_db" == "y" ]] && ! create_database "$db_name" "$db_user" "$db_pass"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if ! create_caddy_site "$domain" "$type" "$username" "$home" "$php_version" "$www_policy"; then
+        echo "Failed to create Caddy config for $domain."
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if [[ "$download_wp" == "y" ]]; then
+        if ! download_wordpress_core "$username" "$home"; then
+            rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+            return 1
+        fi
+        wp_status="downloaded"
+    fi
+    if ! fix_site_permissions "$username" "$home"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if ! save_site_credentials "$domain" "$type" "$username" "$home" "$sftp_password" "$php_version" "$www_policy" "$wp_status" "$db_name" "$db_user" "$db_pass"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+
+    if [[ "$type" != "static" ]] && ! systemctl restart "php$php_version-fpm"; then
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    if ! enable_caddy_config "$CADDY_AVAILABLE/$domain"; then
+        echo "Caddy validation or reload failed. Site config was not enabled."
+        rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
+        return 1
+    fi
+    prune_backups
+
+    echo
+    echo "Site created and enabled."
+    echo "Domain: $domain"
+    echo "SFTP user: $username"
+    echo "SFTP password: $sftp_password"
+    echo "SFTP path: /public_html"
+    echo "Web root: $home/public_html"
+    echo "WWW: $(www_policy_label "$domain" "$www_policy")"
+    [[ "$type" == "wordpress" ]] && echo "WordPress files: $wp_status"
+    if [[ "$create_db" == "y" ]]; then
+        echo "Database host: $DB_HOST"
+        echo "Database name: $db_name"
+        echo "Database user: $db_user"
+        echo "Database password: $db_pass"
+    fi
+    echo "Credentials saved to: $CREDENTIALS_DIR/$domain.txt"
+    echo "Backup: $CURRENT_BACKUP_DIR"
+}
+
+site_files() {
+    shopt -s nullglob
+    for file in "$CADDY_AVAILABLE"/*; do
+        [[ -f "$file" ]] || continue
+        grep -q '^# Managed by encodev-wh-cli' "$file" || continue
+        grep -q '^# type: admin' "$file" && continue
+        printf '%s\n' "$file"
+    done
+    shopt -u nullglob
+}
+
+metadata_value() {
+    local key=$1
+    local file=$2
+    sed -n "s/^# $key: //p" "$file" | head -n 1
+}
+
+list_sites() {
+    local file domain type user php webroot status
+
+    printf '%-28s %-10s %-9s %-16s %-6s %s\n' "Domain" "Type" "Status" "User" "PHP" "Web root"
+    printf '%-28s %-10s %-9s %-16s %-6s %s\n' "------" "----" "------" "----" "---" "--------"
+
+    while IFS= read -r file; do
+        domain=$(metadata_value domain "$file")
+        type=$(metadata_value type "$file")
+        user=$(metadata_value user "$file")
+        php=$(metadata_value php "$file")
+        webroot=$(metadata_value webroot "$file")
+        status="disabled"
+        [[ -L "$CADDY_ENABLED/$(basename "$file")" ]] && status="enabled"
+        printf '%-28s %-10s %-9s %-16s %-6s %s\n' "$domain" "$type" "$status" "$user" "$php" "$webroot"
+    done < <(site_files)
+}
+
+select_site_file() {
+    local files=()
+    local i selected
+
+    mapfile -t files < <(site_files)
+    if (( ${#files[@]} == 0 )); then
+        echo "No managed sites found." >&2
+        return 1
+    fi
+
+    echo >&2
+    echo "Sites:" >&2
+    for i in "${!files[@]}"; do
+        printf '  %d. %s\n' "$((i + 1))" "$(metadata_value domain "${files[$i]}")" >&2
+    done
+
+    printf 'Select site: ' >&2
+    read -r selected
+    [[ "$selected" =~ ^[0-9]+$ ]] || return 1
+    (( selected >= 1 && selected <= ${#files[@]} )) || return 1
+    printf '%s\n' "${files[$((selected - 1))]}"
+}
+
+pool_path_for() {
+    local php=$1
+    local user=$2
+    printf '/etc/php/%s/fpm/pool.d/encodev-%s.conf\n' "$php" "$user"
+}
+
+update_caddy_php_version() {
+    local file=$1
+    local user=$2
+    local old_php=$3
+    local new_php=$4
+    local escaped_old_php
+    local tmp
+
+    escaped_old_php=${old_php//./\\.}
+    tmp=$(mktemp)
+    if ! sed -E \
+        -e "s/^# php: .*/# php: $new_php/" \
+        -e "s#unix//run/php/php${escaped_old_php}-fpm-${user}\.sock#unix//run/php/php${new_php}-fpm-${user}.sock#g" \
+        "$file" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! install -m 0644 "$tmp" "$file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    rm -f "$tmp"
+}
+
+verify_caddy_php_version_update() {
+    local file=$1
+    local user=$2
+    local old_php=$3
+    local new_php=$4
+    local old_ref new_ref
+
+    old_ref=$(php_socket_ref "$old_php" "$user")
+    new_ref=$(php_socket_ref "$new_php" "$user")
+
+    if ! grep -Fq "$new_ref" "$file"; then
+        echo "Caddy config does not reference the new PHP socket: $new_ref" >&2
+        return 1
+    fi
+
+    if grep -Fq "$old_ref" "$file"; then
+        echo "Caddy config still references the old PHP socket: $old_ref" >&2
+        return 1
+    fi
+}
+
+rollback_php_version_change() {
+    local file=$1
+    local new_pool=$2
+    local new_pool_disabled=$3
+    local old_php=$4
+    local new_php=$5
+    local status=$6
+
+    echo "PHP version change failed. Restoring previous config." >&2
+    restore_file_from_backup "$file"
+
+    if path_exists "$(backup_path_for "$new_pool")"; then
+        restore_file_from_backup "$new_pool"
+    else
+        rm -f "$new_pool"
+    fi
+
+    if path_exists "$(backup_path_for "$new_pool_disabled")"; then
+        restore_file_from_backup "$new_pool_disabled"
+    else
+        rm -f "$new_pool_disabled"
+    fi
+
+    systemctl restart "php${old_php}-fpm" || true
+    systemctl restart "php${new_php}-fpm" || true
+    [[ "$status" == "enabled" ]] && systemctl reload caddy || true
+}
+
+change_site_php_version() {
+    local file domain type user old_php new_php webroot home status old_pool new_pool
+    local old_pool_disabled new_pool_disabled timestamp
+
+    file=$(select_site_file) || return 0
+    domain=$(metadata_value domain "$file")
+    type=$(metadata_value type "$file")
+    user=$(metadata_value user "$file")
+    old_php=$(metadata_value php "$file")
+    webroot=$(metadata_value webroot "$file")
+    home=$(dirname "$webroot")
+    status="disabled"
+    [[ -L "$CADDY_ENABLED/$(basename "$file")" ]] && status="enabled"
+
+    if [[ "$type" == "static" ]]; then
+        echo "$domain is a static site and does not use PHP-FPM."
+        return 0
+    fi
+
+    new_php=$(select_installed_php_version) || return 0
+    if [[ "$new_php" == "$old_php" ]]; then
+        echo "$domain already uses PHP $new_php."
+        return 0
+    fi
+
+    echo
+    echo "PHP version change"
+    echo "  Domain:  $domain"
+    echo "  Status:  $status"
+    echo "  User:    $user"
+    echo "  Current: PHP $old_php"
+    echo "  New:     PHP $new_php"
+    echo
+
+    if ! confirm "Change PHP version for $domain?" "n"; then
+        return 0
+    fi
+
+    start_backup_run
+    backup_file "$file"
+
+    old_pool=$(pool_path_for "$old_php" "$user")
+    new_pool=$(pool_path_for "$new_php" "$user")
+    old_pool_disabled="$old_pool.disabled"
+    new_pool_disabled="$new_pool.disabled"
+    timestamp=$(date +%Y%m%d-%H%M%S)
+
+    [[ -f "$old_pool" ]] && backup_file "$old_pool"
+    [[ -f "$old_pool_disabled" ]] && backup_file "$old_pool_disabled"
+    [[ -f "$new_pool" ]] && backup_file "$new_pool"
+    [[ -f "$new_pool_disabled" ]] && backup_file "$new_pool_disabled"
+
+    [[ -f "$new_pool" ]] && mv "$new_pool" "$new_pool.replaced.$timestamp"
+    [[ -f "$new_pool_disabled" ]] && mv "$new_pool_disabled" "$new_pool_disabled.replaced.$timestamp"
+
+    if ! create_php_pool "$user" "$home" "$new_php"; then
+        rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+        return 1
+    fi
+    if [[ "$status" == "disabled" ]]; then
+        if ! mv "$new_pool" "$new_pool_disabled"; then
+            rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+            return 1
+        fi
+    fi
+
+    if ! update_caddy_php_version "$file" "$user" "$old_php" "$new_php"; then
+        rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+        return 1
+    fi
+    if ! verify_caddy_php_version_update "$file" "$user" "$old_php" "$new_php"; then
+        rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+        return 1
+    fi
+
+    if [[ "$status" == "enabled" ]]; then
+        if ! systemctl restart "php${new_php}-fpm"; then
+            rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+            return 1
+        fi
+        if ! caddy validate --config /etc/caddy/Caddyfile; then
+            rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+            return 1
+        fi
+        if ! systemctl reload caddy; then
+            rollback_php_version_change "$file" "$new_pool" "$new_pool_disabled" "$old_php" "$new_php" "$status"
+            return 1
+        fi
+    fi
+
+    if [[ -f "$old_pool" ]]; then
+        mv "$old_pool" "$old_pool.disabled.$timestamp"
+    elif [[ -f "$old_pool_disabled" ]]; then
+        mv "$old_pool_disabled" "$old_pool_disabled.$timestamp"
+    fi
+
+    systemctl restart "php${old_php}-fpm" || true
+    if [[ "$status" != "enabled" ]]; then
+        systemctl restart "php${new_php}-fpm" || true
+    fi
+    if ! update_site_credentials_php_version "$domain" "$new_php"; then
+        echo "Warning: site PHP changed, but credentials metadata was not updated." >&2
+    fi
+    prune_backups
+
+    echo "$domain now uses PHP $new_php."
+    echo "Backup: $CURRENT_BACKUP_DIR"
+}
+
+disable_site() {
+    local file domain type user php pool enabled timestamp
+
+    file=$(select_site_file) || return 0
+    domain=$(metadata_value domain "$file")
+    type=$(metadata_value type "$file")
+    user=$(metadata_value user "$file")
+    php=$(metadata_value php "$file")
+    enabled="$CADDY_ENABLED/$(basename "$file")"
+
+    if ! confirm "Disable $domain? Files and database will stay untouched." "n"; then
+        return 0
+    fi
+
+    if ! path_exists "$enabled"; then
+        echo "$domain is already disabled."
+        return 0
+    fi
+
+    start_backup_run
+    backup_file "$file"
+    backup_file "$enabled"
+
+    rm -f "$enabled"
+    if ! caddy validate --config /etc/caddy/Caddyfile; then
+        restore_file_from_backup "$enabled"
+        echo "Caddy validation failed. Site was not disabled."
+        return 1
+    fi
+    if ! systemctl reload caddy; then
+        restore_file_from_backup "$enabled"
+        systemctl reload caddy || true
+        echo "Caddy reload failed. Site was not disabled."
+        return 1
+    fi
+
+    if [[ "$type" != "static" ]]; then
+        pool=$(pool_path_for "$php" "$user")
+        if [[ -f "$pool" ]]; then
+            backup_file "$pool"
+            timestamp=$(date +%Y%m%d-%H%M%S)
+            if [[ -f "$pool.disabled" ]]; then
+                backup_file "$pool.disabled"
+                mv "$pool.disabled" "$pool.disabled.$timestamp"
+            fi
+            mv "$pool" "$pool.disabled"
+            if ! systemctl restart "php${php}-fpm"; then
+                echo "Warning: Caddy stopped serving $domain, but PHP-FPM restart failed after disabling its pool." >&2
+            fi
+        fi
+    fi
+
+    prune_backups
+    echo "$domain disabled. Files and database were not modified."
+}
+
+enable_site() {
+    local file domain type user php pool pool_enabled=0
+
+    file=$(select_site_file) || return 0
+    domain=$(metadata_value domain "$file")
+    type=$(metadata_value type "$file")
+    user=$(metadata_value user "$file")
+    php=$(metadata_value php "$file")
+
+    if ! confirm "Enable $domain?" "y"; then
+        return 0
+    fi
+
+    start_backup_run
+
+    if [[ "$type" != "static" ]]; then
+        pool=$(pool_path_for "$php" "$user")
+        if [[ -f "$pool.disabled" ]]; then
+            backup_file "$pool.disabled"
+            mv "$pool.disabled" "$pool"
+            pool_enabled=1
+            if ! systemctl restart "php${php}-fpm"; then
+                mv "$pool" "$pool.disabled"
+                echo "PHP-FPM restart failed. Site was not enabled." >&2
+                return 1
+            fi
+        elif [[ ! -f "$pool" ]]; then
+            echo "Missing PHP-FPM pool for $domain: $pool" >&2
+            echo "Use Change site PHP version or recreate the managed pool before enabling." >&2
+            return 1
+        fi
+    fi
+
+    if ! enable_caddy_config "$file"; then
+        if [[ "$pool_enabled" -eq 1 ]]; then
+            mv "$pool" "$pool.disabled"
+            systemctl restart "php${php}-fpm" || true
+        fi
+        echo "Caddy validation or reload failed. Site was not enabled."
+        return 1
+    fi
+    prune_backups
+    echo "$domain enabled."
+}
+
+scan_server() {
+    local apache_packages apache_configs htaccess_hits listeners
+
+    echo
+    echo "Server scan"
+    print_status
+
+    echo "Web server conflicts:"
+    if service_is_active apache2 || service_is_active nginx || service_is_enabled apache2 || service_is_enabled nginx; then
+        service_is_active apache2 && echo "  apache2: active"
+        service_is_enabled apache2 && echo "  apache2: enabled"
+        service_is_active nginx && echo "  nginx: active"
+        service_is_enabled nginx && echo "  nginx: enabled"
+    else
+        echo "  none active or enabled"
+    fi
+    echo
+
+    if command_exists ss; then
+        listeners=$(ss -ltnp 2>/dev/null | awk '$4 ~ /:(80|443)$/ { print "  " $0 }' | head -n 10 || true)
+        if [[ -n "$listeners" ]]; then
+            echo "Port 80/443 listeners:"
+            echo "$listeners"
+            echo
+        fi
+    fi
+
+    if command_exists dpkg-query; then
+        apache_packages=$(dpkg-query -W -f='${binary:Package} ${db:Status-Abbrev}\n' 'apache2*' 'libapache2-mod-php*' 2>/dev/null \
+            | awk '$2 == "ii" { print "  " $1 }' || true)
+        if [[ -n "$apache_packages" ]]; then
+            echo "Installed Apache-related packages:"
+            echo "$apache_packages"
+            echo
+        fi
+    fi
+
+    if [[ -d /etc/apache2 ]]; then
+        apache_configs=$(grep -RInE '^[[:space:]]*(ServerName|ServerAlias|DocumentRoot|ProxyPass|SetHandler|Directory|VirtualHost|Listen)[[:space:]]+' \
+            /etc/apache2 2>/dev/null | head -n 30 || true)
+        if [[ -n "$apache_configs" ]]; then
+            echo "Apache config entries to review for migration:"
+            echo "$apache_configs"
+            echo
+        fi
+    fi
+
+    htaccess_hits=$(find /var/www /home -name .htaccess -type f 2>/dev/null | head -n 20 || true)
+    if [[ -n "$htaccess_hits" ]]; then
+        echo ".htaccess files found; Caddy ignores them:"
+        echo "$htaccess_hits"
+        echo
+    fi
+
+    if command_exists caddy && [[ -f /etc/caddy/Caddyfile ]]; then
+        caddy validate --config /etc/caddy/Caddyfile
+    fi
+
+    echo "Server scan complete."
+}
+
+scan_site() {
+    local file domain type user php webroot home status upload_hits htaccess_hits hardcoded_hits pool
+    local wp_home wp_cache
+
+    file=$(select_site_file) || return 0
+    domain=$(metadata_value domain "$file")
+    type=$(metadata_value type "$file")
+    user=$(metadata_value user "$file")
+    php=$(metadata_value php "$file")
+    webroot=$(metadata_value webroot "$file")
+    home=$(dirname "$webroot")
+    status="disabled"
+    [[ -L "$CADDY_ENABLED/$(basename "$file")" ]] && status="enabled"
+
+    echo
+    echo "Scan: $domain"
+    echo "  Type: $type"
+    echo "  Status: $status"
+    echo "  User: $user"
+    echo "  PHP: $php"
+    echo "  Web root: $webroot"
+    echo
+
+    [[ -d "$webroot" ]] || { echo "Missing web root."; return 0; }
+
+    if [[ "$type" != "static" ]]; then
+        pool=$(pool_path_for "$php" "$user")
+        if [[ ! -f "$pool" && "$status" == "enabled" ]]; then
+            echo "Missing active PHP-FPM pool for enabled site: $pool"
+            echo
+        elif [[ ! -f "$pool" && ! -f "$pool.disabled" ]]; then
+            echo "Missing PHP-FPM pool: $pool"
+            echo
+        fi
+    fi
+
+    htaccess_hits=$(find "$webroot" -name .htaccess -type f 2>/dev/null | head -n 5 || true)
+    if [[ -n "$htaccess_hits" ]]; then
+        echo ".htaccess files found; Caddy ignores them:"
+        echo "$htaccess_hits"
+        echo
+    fi
+
+    upload_hits=$(find "$webroot/wp-content/uploads" "$webroot/uploads" "$webroot/data" "$webroot/cache" \
+        -type f -name '*.php' 2>/dev/null | head -n 5 || true)
+    if [[ -n "$upload_hits" ]]; then
+        echo "PHP files found in upload/data/cache paths:"
+        echo "$upload_hits"
+        echo
+    fi
+
+    hardcoded_hits=$(grep -RIl --include='*.php' --include='*.sql' --include='*.ini' \
+        -e '/var/www/' -e 'www-data' "$webroot" 2>/dev/null | head -n 5 || true)
+    if [[ -n "$hardcoded_hits" ]]; then
+        echo "Legacy Apache/path references found:"
+        echo "$hardcoded_hits"
+        echo
+    fi
+
+    if [[ -f "$webroot/wp-config.php" ]] && command_exists wp; then
+        echo "WordPress detected. Running WP-CLI checks as $user..."
+        wp_home="$home/tmp"
+        wp_cache="$wp_home/wp-cli-cache"
+        if prepare_wp_cli_runtime "$user" "$home"; then
+            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" core version 2>/dev/null || true
+            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" option get siteurl 2>/dev/null || true
+            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" option get home 2>/dev/null || true
+            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" plugin list --status=active 2>/dev/null || true
+        else
+            echo "Could not prepare WP-CLI cache under $home/tmp; skipping WP-CLI checks."
+        fi
+        echo
+    fi
+
+    if command_exists caddy && [[ -f /etc/caddy/Caddyfile ]]; then
+        caddy validate --config /etc/caddy/Caddyfile
+    else
+        echo "Caddy is not installed or /etc/caddy/Caddyfile is missing."
+    fi
+    echo "Scan complete."
+}
+
+print_status() {
+    local enabled disabled
+    local php_versions
+    enabled=0
+    disabled=0
+
+    while IFS= read -r file; do
+        if [[ -L "$CADDY_ENABLED/$(basename "$file")" ]]; then
+            ((enabled += 1))
+        else
+            ((disabled += 1))
+        fi
+    done < <(site_files)
+
+    echo "Status:"
+    echo "  Caddy:   $(service_state caddy)"
+    echo "  MariaDB: $(service_state mariadb)"
+    echo "  UFW:     $(command_exists ufw && ufw status 2>/dev/null | head -n 1 | sed 's/^Status: //' || printf 'missing')"
+    php_versions=$(installed_php_versions | paste -sd ',' - 2>/dev/null || true)
+    [[ -z "$php_versions" ]] && php_versions="missing"
+    echo "  PHP-FPM: $php_versions"
+    echo "  Sites:   $enabled enabled, $disabled disabled"
+    echo
+}
+
+main_menu() {
+    local choice
+
+    while true; do
+        clear || true
+        echo "$APP_NAME"
+        echo
+        print_status
+        echo "1. Setup server"
+        echo "2. Add site"
+        echo "3. List sites"
+        echo "4. Disable site"
+        echo "5. Enable site"
+        echo "6. Change site PHP version"
+        echo "7. Install PHP version"
+        echo "8. Scan server"
+        echo "9. Scan site"
+        echo "10. Exit"
+        echo
+        read -r -p "Choose an option: " choice
+
+        case "$choice" in
+            1) setup_server; pause ;;
+            2) add_site; pause ;;
+            3) list_sites; pause ;;
+            4) disable_site; pause ;;
+            5) enable_site; pause ;;
+            6) change_site_php_version; pause ;;
+            7) install_php_versions_menu; pause ;;
+            8) scan_server; pause ;;
+            9) scan_site; pause ;;
+            10) exit 0 ;;
+            *) echo "Invalid option."; pause ;;
+        esac
+    done
+}
+
+main() {
+    require_root
+    ensure_app_dirs
+
+    if (( $# > 0 )); then
+        echo "This CLI is interactive for now. Run without arguments: sudo wh"
+        exit 1
+    fi
+
+    main_menu
+}
+
+main "$@"
