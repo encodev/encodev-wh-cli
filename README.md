@@ -25,10 +25,10 @@ License: source-available for reference only. All rights reserved by Encodev.
 ## What It Does
 
 - Sets up a fresh Debian web server.
-- Uses Caddy only, with automatic HTTPS.
+- Uses Debian's Caddy package only, with automatic HTTPS.
 - Refuses setup when Apache or Nginx is active or enabled.
 - Restricts the SSH port to one whitelisted IPv4 with UFW.
-- Disables root SSH login while keeping admin password SSH available.
+- Hardens SSH while preserving non-root admin access.
 - Installs simple Fail2ban SSH protection.
 - Installs selectable PHP-FPM versions from Sury.
 - Installs MariaDB with root socket authentication.
@@ -39,6 +39,7 @@ License: source-available for reference only. All rights reserved by Encodev.
 - Generates site usernames like `site_example_com`.
 - Can download latest WordPress files during WordPress site creation.
 - Normalizes site file permissions before enabling a site.
+- Adds defensive Caddy rules for sensitive files and upload paths.
 - Lets each site choose its `www` alias behavior.
 - Creates per-site PHP-FPM pools, logs, databases, and credentials.
 - Lets existing sites switch to another installed PHP-FPM version.

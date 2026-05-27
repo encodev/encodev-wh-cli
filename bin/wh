@@ -26,10 +26,14 @@ WP_CLI_TAG="v${WP_CLI_VERSION}"
 WP_CLI_ASSET="wp-cli-${WP_CLI_VERSION}.phar"
 WP_CLI_URL="https://github.com/${WP_CLI_REPO}/releases/download/${WP_CLI_TAG}/${WP_CLI_ASSET}"
 WP_CLI_ASSET_SHA256="ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c"
+SURY_APT_KEY_FINGERPRINT="15058500A0235D97F5D10063B188E2B695BD4743"
 MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
 MANAGED_END="# END encodev-wh-cli managed"
 DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
 PHP_EXTENSIONS=(cli mysql curl mbstring xml zip gd intl bcmath soap imagick opcache)
+SENSITIVE_PATH_REGEXP='(?i)(?:(^|/)(?:\.git|\.svn|\.hg)(?:/|$)|(^|/)(?:\.env[^/]*|\.htaccess|\.htpasswd|\.user\.ini|wp-config\.php|composer\.(?:json|lock)|auth\.json|package(?:-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$|\.(?:sql|sqlite3?|db|bak|backup|old|orig|save|sw[op]|tmp)$)'
+STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
+UPLOAD_EXECUTABLE_REGEXP='(?i)^/(?:wp-content/uploads|uploads|data|cache)/.*\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 
 require_root() {
     if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
@@ -119,6 +123,55 @@ validate_username() {
     [[ "$username" =~ ^[a-z_][a-z0-9_-]{0,30}$ ]]
 }
 
+detect_admin_user() {
+    local user=${SUDO_USER:-}
+
+    if [[ -n "$user" && "$user" != "root" ]] && id "$user" >/dev/null 2>&1; then
+        printf '%s\n' "$user"
+    fi
+}
+
+require_admin_ssh_user() {
+    local user=$1
+    local entry shell status
+
+    if [[ -z "$user" ]]; then
+        echo "Enter an existing non-root user that can keep SSH admin access." >&2
+        return 1
+    fi
+    if [[ "$user" == "root" ]]; then
+        echo "Root cannot be the SSH admin user because setup disables root SSH login." >&2
+        return 1
+    fi
+    if ! entry=$(getent passwd "$user"); then
+        echo "Admin user does not exist: $user" >&2
+        return 1
+    fi
+
+    shell=${entry##*:}
+    case "$shell" in
+        ""|/usr/sbin/nologin|/sbin/nologin|/bin/false|/usr/bin/false)
+            echo "Admin user does not have an interactive login shell: $user ($shell)" >&2
+            return 1
+            ;;
+    esac
+    if [[ -r /etc/shells ]] && ! grep -Fxq "$shell" /etc/shells; then
+        echo "Admin user's shell is not listed in /etc/shells: $user ($shell)" >&2
+        return 1
+    fi
+
+    if ! id -nG "$user" | tr ' ' '\n' | grep -Eq '^(sudo|admin)$'; then
+        echo "Admin user must belong to the sudo or admin group: $user" >&2
+        return 1
+    fi
+
+    status=$(passwd -S "$user" 2>/dev/null | awk '{print $2}' || true)
+    if [[ "$status" != "P" ]]; then
+        echo "Admin user must have an unlocked password for SSH password login: $user" >&2
+        return 1
+    fi
+}
+
 validate_timezone() {
     if command_exists timedatectl && timedatectl list-timezones 2>/dev/null | grep -Fxq "$1"; then
         return 0
@@ -157,6 +210,63 @@ detect_ssh_port() {
     else
         printf '%s\n' "22"
     fi
+}
+
+sshd_configured_for_port() {
+    local port=$1
+    local configured found=0
+
+    if ! command_exists sshd; then
+        echo "Missing required command: sshd." >&2
+        return 1
+    fi
+
+    while IFS= read -r configured; do
+        [[ "$configured" == "$port" ]] && found=1
+    done < <(sshd -T 2>/dev/null | awk '$1 == "port" { print $2 }')
+
+    if (( found == 0 )); then
+        echo "OpenSSH is not configured to listen on TCP port $port." >&2
+        echo "Check the current SSH port before enabling UFW." >&2
+        return 1
+    fi
+}
+
+sshd_listening_on_port() {
+    local port=$1
+    local line local_addr found_port=0
+
+    require_command ss || return 1
+
+    while IFS= read -r line; do
+        set -- $line
+        [[ $# -ge 4 ]] || continue
+        local_addr=$4
+        [[ "$local_addr" == *":$port" ]] || continue
+
+        found_port=1
+        if [[ "$line" == *sshd* ]]; then
+            return 0
+        fi
+    done < <(ss -H -ltnp 2>/dev/null || true)
+
+    if (( found_port != 0 )); then
+        echo "TCP port $port is listening, but the listener does not appear to be sshd." >&2
+    else
+        echo "No active sshd listener found on TCP port $port." >&2
+    fi
+    return 1
+}
+
+require_active_ssh_port() {
+    local port=$1
+
+    validate_port "$port" || {
+        echo "Invalid SSH port: $port" >&2
+        return 1
+    }
+    sshd_configured_for_port "$port" || return 1
+    sshd_listening_on_port "$port" || return 1
 }
 
 username_from_domain() {
@@ -318,27 +428,28 @@ download_verified_github_asset() {
     rm -f "$tmp"
 }
 
-download_url_file() {
-    local url=$1
-    local dest=$2
-    local mode=${3:-0644}
-    local tmp
+normalize_fingerprint() {
+    printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'
+}
 
-    tmp=$(mktemp)
-    if ! curl -fsSL "$url" -o "$tmp"; then
-        rm -f "$tmp"
+keyring_has_fingerprint() {
+    local keyring=$1
+    local expected
+
+    expected=$(normalize_fingerprint "$2")
+    if [[ ! "$expected" =~ ^[A-F0-9]{40}$ ]]; then
+        echo "Invalid pinned OpenPGP fingerprint: $2" >&2
         return 1
     fi
-    if ! install -m "$mode" "$tmp" "$dest"; then
-        rm -f "$tmp"
-        return 1
-    fi
-    rm -f "$tmp"
+
+    gpg --show-keys --with-colons "$keyring" 2>/dev/null \
+        | awk -F: -v expected="$expected" '$1 == "fpr" && toupper($10) == expected { found = 1 } END { exit found ? 0 : 1 }'
 }
 
 install_apt_keyring() {
     local url=$1
     local dest=$2
+    local expected_fingerprint=$3
     local key_tmp gpg_tmp
 
     key_tmp=$(mktemp)
@@ -351,11 +462,37 @@ install_apt_keyring() {
         rm -f "$key_tmp" "$gpg_tmp"
         return 1
     fi
+    if ! keyring_has_fingerprint "$gpg_tmp" "$expected_fingerprint"; then
+        echo "Downloaded APT key fingerprint mismatch for $url." >&2
+        echo "Expected: $(normalize_fingerprint "$expected_fingerprint")" >&2
+        echo "Actual fingerprints:" >&2
+        gpg --show-keys --with-colons "$gpg_tmp" 2>/dev/null \
+            | awk -F: '$1 == "fpr" { print "  " $10 }' >&2 || true
+        rm -f "$key_tmp" "$gpg_tmp"
+        return 1
+    fi
+    if ! backup_file "$dest"; then
+        rm -f "$key_tmp" "$gpg_tmp"
+        return 1
+    fi
     if ! install -m 0644 "$gpg_tmp" "$dest"; then
         rm -f "$key_tmp" "$gpg_tmp"
         return 1
     fi
     rm -f "$key_tmp" "$gpg_tmp"
+}
+
+ensure_apt_keyring() {
+    local url=$1
+    local dest=$2
+    local expected_fingerprint=$3
+
+    if [[ -f "$dest" ]] && keyring_has_fingerprint "$dest" "$expected_fingerprint"; then
+        return 0
+    fi
+
+    [[ -f "$dest" ]] && echo "Replacing unexpected APT keyring: $dest" >&2
+    install_apt_keyring "$url" "$dest" "$expected_fingerprint"
 }
 
 php_socket_ref() {
@@ -389,6 +526,28 @@ start_backup_run() {
     CURRENT_BACKUP_DIR="$BACKUP_DIR/$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$CURRENT_BACKUP_DIR"
     chmod 700 "$CURRENT_BACKUP_DIR"
+}
+
+setup_failure_report() {
+    local status=$?
+
+    trap - ERR
+    echo >&2
+    echo "Setup failed during: ${CURRENT_SETUP_STEP:-unknown step}" >&2
+    if [[ -n "${CURRENT_BACKUP_DIR:-}" ]]; then
+        echo "Backup: $CURRENT_BACKUP_DIR" >&2
+    fi
+    echo "No automatic rollback was performed." >&2
+    return "$status"
+}
+
+run_setup_step() {
+    local label=$1
+    shift
+
+    CURRENT_SETUP_STEP=$label
+    echo "==> $label"
+    "$@"
 }
 
 backup_path_for() {
@@ -550,24 +709,13 @@ prepare_repositories() {
     codename=$(. /etc/os-release && printf '%s\n' "$VERSION_CODENAME")
 
     apt update
-    apt install -y ca-certificates curl gnupg debian-keyring debian-archive-keyring apt-transport-https lsb-release
+    apt install -y ca-certificates curl gnupg apt-transport-https
 
-    if [[ ! -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg ]]; then
-        install_apt_keyring \
-            https://dl.cloudsmith.io/public/caddy/stable/gpg.key \
-            /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    fi
-    if [[ ! -f /etc/apt/sources.list.d/caddy-stable.list ]]; then
-        download_url_file \
-            https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt \
-            /etc/apt/sources.list.d/caddy-stable.list
-    fi
+    ensure_apt_keyring \
+        https://packages.sury.org/php/apt.gpg \
+        /usr/share/keyrings/deb.sury.org-php.gpg \
+        "$SURY_APT_KEY_FINGERPRINT"
 
-    if [[ ! -f /usr/share/keyrings/deb.sury.org-php.gpg ]]; then
-        install_apt_keyring \
-            https://packages.sury.org/php/apt.gpg \
-            /usr/share/keyrings/deb.sury.org-php.gpg
-    fi
     write_file /etc/apt/sources.list.d/php-sury.list <<EOF
 deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ $codename main
 EOF
@@ -628,6 +776,8 @@ configure_ufw() {
     local admin_ip=$1
     local ssh_port=$2
 
+    require_active_ssh_port "$ssh_port" || return 1
+
     backup_file /etc/ufw/user.rules
     backup_file /etc/ufw/user6.rules
 
@@ -676,9 +826,12 @@ ssh_config_has_active_match() {
 }
 
 configure_sshd() {
+    local admin_user=$1
     local config=/etc/ssh/sshd_config
     local hardening_dropin=/etc/ssh/sshd_config.d/00-encodev-wh-cli.conf
     local tmp
+
+    require_admin_ssh_user "$admin_user" || return 1
 
     backup_file "$config"
     tmp=$(mktemp)
@@ -877,12 +1030,12 @@ EOF
 }
 
 install_base_packages() {
-    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server
+    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server iproute2
     systemctl enable caddy --now
 }
 
 setup_server() {
-    local admin_host admin_ip ssh_port timezone primary_php
+    local admin_host admin_ip admin_user ssh_port timezone primary_php
 
     ensure_app_dirs
     preflight_setup_environment || return 1
@@ -897,6 +1050,11 @@ setup_server() {
     while ! validate_ipv4 "$admin_ip"; do
         echo "Enter a valid IPv4 address."
         admin_ip=$(prompt "Admin IPv4 allowed for SSH and /dba" "$admin_ip")
+    done
+
+    admin_user=$(prompt "Non-root sudo/admin SSH user" "$(detect_admin_user)")
+    while ! require_admin_ssh_user "$admin_user"; do
+        admin_user=$(prompt "Non-root sudo/admin SSH user" "$admin_user")
     done
 
     ssh_port=$(prompt "Current SSH port" "$(detect_ssh_port)")
@@ -923,6 +1081,7 @@ setup_server() {
     echo "Setup summary"
     echo "  Admin host:      $admin_host"
     echo "  Admin IPv4:      $admin_ip"
+    echo "  SSH admin user:  $admin_user"
     echo "  SSH port:        $ssh_port"
     echo "  SSH password:    enabled for non-root users"
     echo "  Timezone:        $timezone"
@@ -930,7 +1089,7 @@ setup_server() {
     echo "  Default locale:  $DEFAULT_LOCALE"
     echo "  PHP versions:    choose after repositories are prepared"
     echo "  MariaDB:         install and harden with root socket auth"
-    echo "  Caddy:           install and use sites-enabled imports"
+    echo "  Caddy:           install Debian package and use sites-enabled imports"
     echo "  UFW:             SSH port $ssh_port from $admin_ip only, public 80/443"
     echo "  Fail2ban:        SSH jail"
     echo "  Adminer:         https://$admin_host/dba, IP restricted"
@@ -941,25 +1100,36 @@ setup_server() {
         return 0
     fi
 
-    start_backup_run
-    prepare_repositories
-    select_php_versions_to_install
+    CURRENT_SETUP_STEP="starting setup"
+    trap setup_failure_report ERR
+
+    run_setup_step "Start backup run" start_backup_run
+    run_setup_step "Prepare repositories" prepare_repositories
+    run_setup_step "Select PHP versions" select_php_versions_to_install
+    if (( ${#SELECTED_PHP_VERSIONS[@]} == 0 )); then
+        echo "No PHP versions were selected." >&2
+        return 1
+    fi
     primary_php=${SELECTED_PHP_VERSIONS[0]}
 
-    install_base_packages
-    install_php_versions
-    configure_timezone_and_locales "$timezone"
-    configure_caddy_base
-    groupadd -f "$SFTP_GROUP"
-    configure_sshd
-    configure_fail2ban "$ssh_port"
-    secure_mariadb
-    install_wp_cli
-    install_adminer "$admin_host" "$admin_ip" "$primary_php"
-    caddy validate --config /etc/caddy/Caddyfile
-    systemctl reload caddy
-    configure_ufw "$admin_ip" "$ssh_port"
-    prune_backups
+    run_setup_step "Install base packages" install_base_packages
+    run_setup_step "Install PHP versions" install_php_versions
+    run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
+    run_setup_step "Configure Caddy base" configure_caddy_base
+    run_setup_step "Create SFTP group" groupadd -f "$SFTP_GROUP"
+    run_setup_step "Configure SSH" configure_sshd "$admin_user"
+    run_setup_step "Verify active SSH port" require_active_ssh_port "$ssh_port"
+    run_setup_step "Configure Fail2ban" configure_fail2ban "$ssh_port"
+    run_setup_step "Secure MariaDB" secure_mariadb
+    run_setup_step "Install WP-CLI" install_wp_cli
+    run_setup_step "Install Adminer" install_adminer "$admin_host" "$admin_ip" "$primary_php"
+    run_setup_step "Validate Caddy" caddy validate --config /etc/caddy/Caddyfile
+    run_setup_step "Reload Caddy" systemctl reload caddy
+    run_setup_step "Configure UFW" configure_ufw "$admin_ip" "$ssh_port"
+    run_setup_step "Prune backups" prune_backups
+
+    trap - ERR
+    unset CURRENT_SETUP_STEP
 
     echo
     echo "Setup complete."
@@ -979,7 +1149,7 @@ install_php_versions_menu() {
 
     echo
     echo "Install additional PHP-FPM versions"
-    echo "This prepares the Caddy/Sury repositories and installs selected PHP-FPM packages."
+    echo "This prepares the Sury PHP repository and installs selected PHP-FPM packages."
     echo
 
     if ! confirm "Continue?" "y"; then
@@ -1013,16 +1183,11 @@ site_type_prompt() {
     esac
 }
 
-is_apex_like_domain() {
-    local domain=$1
-    [[ $(grep -o '\.' <<< "$domain" | wc -l) -eq 1 ]]
-}
-
 www_policy_prompt() {
     local domain=$1
     local choice
 
-    if ! is_apex_like_domain "$domain"; then
+    if [[ "$domain" == www.* ]]; then
         printf '%s\n' "none"
         return 0
     fi
@@ -1345,7 +1510,7 @@ create_caddy_site() {
         return 1
     fi
 
-    if ! is_apex_like_domain "$domain"; then
+    if [[ "$domain" == www.* ]]; then
         www_policy="none"
     fi
 
@@ -1373,21 +1538,25 @@ create_caddy_site() {
     if [[ "$type" == "static" ]]; then
         managed_block="    $MANAGED_BEGIN
     @sensitive_paths {
-        path /.git* /.svn* /.hg* /.env* /composer.json /composer.lock /package.json /package-lock.json /yarn.lock /pnpm-lock.yaml /wp-config.php /*.sql /*.bak /*.backup /*.old
+        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
     }
     respond @sensitive_paths \"Not Found\" 404
+    @executable_static_files {
+        path_regexp executable_static_files $STATIC_EXECUTABLE_REGEXP
+    }
+    respond @executable_static_files \"Not Found\" 404
     file_server
     $MANAGED_END"
     else
         managed_block="    $MANAGED_BEGIN
     @sensitive_paths {
-        path /.git* /.svn* /.hg* /.env* /composer.json /composer.lock /package.json /package-lock.json /yarn.lock /pnpm-lock.yaml /wp-config.php /*.sql /*.bak /*.backup /*.old
+        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
     }
     respond @sensitive_paths \"Not Found\" 404
-    @blocked_php_uploads {
-        path_regexp blocked_php ^/(wp-content/uploads|uploads|data|cache)/.*\\.php$
+    @blocked_upload_executables {
+        path_regexp blocked_upload_executables $UPLOAD_EXECUTABLE_REGEXP
     }
-    respond @blocked_php_uploads \"Forbidden\" 403
+    respond @blocked_upload_executables \"Forbidden\" 403
     try_files {path} {path}/ /index.php?{query}
     php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
     file_server
