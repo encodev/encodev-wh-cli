@@ -18,12 +18,14 @@ ADMINER_REPO="vrana/adminer"
 ADMINER_TAG="v${ADMINER_VERSION}"
 ADMINER_ASSET="adminer-${ADMINER_VERSION}-mysql-en.php"
 ADMINER_URL="https://github.com/${ADMINER_REPO}/releases/download/${ADMINER_TAG}/${ADMINER_ASSET}"
+ADMINER_ASSET_SHA256="b90f7e113497ee65e6f2e7f3eb2d953cdcfc44ef5ae2ca5ee8d39794c713f7e7"
 DB_HOST="127.0.0.1"
 WP_CLI_VERSION="2.12.0"
 WP_CLI_REPO="wp-cli/wp-cli"
 WP_CLI_TAG="v${WP_CLI_VERSION}"
 WP_CLI_ASSET="wp-cli-${WP_CLI_VERSION}.phar"
 WP_CLI_URL="https://github.com/${WP_CLI_REPO}/releases/download/${WP_CLI_TAG}/${WP_CLI_ASSET}"
+WP_CLI_ASSET_SHA256="ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c"
 MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
 MANAGED_END="# END encodev-wh-cli managed"
 DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
@@ -141,8 +143,6 @@ detect_ssh_client_ip() {
 
     if validate_ipv4 "$detected"; then
         printf '%s\n' "$detected"
-    else
-        printf '%s\n' "203.0.113.10"
     fi
 }
 
@@ -284,44 +284,15 @@ restore_file_from_backup() {
     fi
 }
 
-github_release_asset_digest() {
-    local repo=$1
-    local tag=$2
-    local asset=$3
-    local api tmp digest
-
-    api="https://api.github.com/repos/$repo/releases/tags/$tag"
-    tmp=$(mktemp)
-    if ! curl -fsSL \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        -H "User-Agent: encodev-wh-cli" \
-        "$api" -o "$tmp"; then
-        rm -f "$tmp"
-        return 1
-    fi
-
-    digest=$(grep -F -A80 "\"name\": \"$asset\"" "$tmp" \
-        | sed -n 's/.*"digest": "sha256:\([a-fA-F0-9]\{64\}\)".*/\1/p' \
-        | head -n 1)
-    rm -f "$tmp"
-
-    if [[ -z "$digest" ]]; then
-        echo "Could not find SHA-256 digest for $asset in $repo $tag." >&2
-        return 1
-    fi
-    printf '%s\n' "$digest"
-}
-
 download_verified_github_asset() {
-    local repo=$1
-    local tag=$2
-    local asset=$3
-    local url=$4
-    local dest=$5
-    local tmp expected actual
+    local asset=$1
+    local url=$2
+    local expected=$3
+    local dest=$4
+    local tmp actual
 
-    if ! expected=$(github_release_asset_digest "$repo" "$tag" "$asset"); then
+    if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ ]]; then
+        echo "Invalid pinned SHA-256 checksum for $asset." >&2
         return 1
     fi
 
@@ -801,7 +772,7 @@ SQL
 }
 
 install_wp_cli() {
-    download_verified_github_asset "$WP_CLI_REPO" "$WP_CLI_TAG" "$WP_CLI_ASSET" "$WP_CLI_URL" /usr/local/bin/wp
+    download_verified_github_asset "$WP_CLI_ASSET" "$WP_CLI_URL" "$WP_CLI_ASSET_SHA256" /usr/local/bin/wp
     chmod +x /usr/local/bin/wp
     wp --info --allow-root >/dev/null
 }
@@ -862,7 +833,7 @@ install_adminer() {
     fi
 
     mkdir -p "$ADMINER_DIR" || return 1
-    download_verified_github_asset "$ADMINER_REPO" "$ADMINER_TAG" "$ADMINER_ASSET" "$ADMINER_URL" "$ADMINER_FILE" || return 1
+    download_verified_github_asset "$ADMINER_ASSET" "$ADMINER_URL" "$ADMINER_ASSET_SHA256" "$ADMINER_FILE" || return 1
     chown -R root:root "$ADMINER_DIR" || return 1
     chmod 755 "$ADMINER_DIR" || return 1
     chmod 644 "$ADMINER_FILE" || return 1
