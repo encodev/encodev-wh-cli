@@ -32,6 +32,8 @@ Possible future features for Encodev WH CLI.
 - Rotate SFTP password.
 - Clone an existing site to a new domain.
 - Remove a site with clear confirmation and backups.
+- Add a per-site PHP settings workflow for managed PHP-FPM pools, including
+  upload size changes such as `upload_max_filesize` and `post_max_size`.
 - Support optional per-site custom Caddy include files for routing rules that
   should stay outside CLI-managed blocks. The generated site config could import
   `/etc/caddy/sites-custom/<domain>.caddy` near the top of the site block, before
