@@ -805,6 +805,42 @@ installed_php_versions() {
     done | sort -Vr
 }
 
+php_packages_for_version() {
+    local version=$1
+    local ext
+
+    validate_php_version "$version" || {
+        echo "Invalid PHP version: $version" >&2
+        return 1
+    }
+
+    printf 'php%s-fpm\n' "$version"
+    for ext in "${PHP_EXTENSIONS[@]}"; do
+        printf 'php%s-%s\n' "$version" "$ext"
+    done
+}
+
+apt_package_available() {
+    local package=$1
+
+    apt-cache show "$package" >/dev/null 2>&1
+}
+
+php_version_packages_available() {
+    local version=$1
+    local verbose=${2:-n}
+    local package missing=0
+
+    while IFS= read -r package; do
+        if ! apt_package_available "$package"; then
+            [[ "$verbose" == "y" ]] && echo "Missing package for PHP $version: $package" >&2
+            missing=1
+        fi
+    done < <(php_packages_for_version "$version")
+
+    (( missing == 0 ))
+}
+
 available_php_versions() {
     local version
 
@@ -813,6 +849,7 @@ available_php_versions() {
         | sed -E 's/^php([0-9]+\.[0-9]+)-fpm$/\1/' \
         | while IFS= read -r version; do
             validate_php_version "$version" || continue
+            php_version_packages_available "$version" || continue
             printf '%s\n' "$version"
         done \
         | sort -Vr
@@ -836,7 +873,14 @@ select_php_versions_to_install() {
 
     mapfile -t versions < <(available_php_versions)
     if (( ${#versions[@]} == 0 )); then
-        versions=(8.4 8.3 8.2 8.1 7.4 5.6)
+        for version in 8.4 8.3 8.2 8.1 7.4 5.6; do
+            php_version_packages_available "$version" || continue
+            versions+=("$version")
+        done
+    fi
+    if (( ${#versions[@]} == 0 )); then
+        echo "No complete PHP-FPM package sets are available. Check the configured APT repositories." >&2
+        return 1
     fi
 
     echo >&2
@@ -852,7 +896,7 @@ select_php_versions_to_install() {
     done
     [[ $default_index -eq 0 ]] && default_index=1
 
-    printf 'Enter one or more numbers [%s]: ' "$default_index" >&2
+    printf 'Enter one or more numbers, separated by spaces or commas [%s]: ' "$default_index" >&2
     read -r choices
     choices=${choices:-$default_index}
     choices=${choices//,/ }
@@ -920,17 +964,12 @@ EOF
 }
 
 install_php_versions() {
-    local version ext packages=()
+    local version packages=() version_packages=()
 
     for version in "${SELECTED_PHP_VERSIONS[@]}"; do
-        validate_php_version "$version" || {
-            echo "Invalid PHP version: $version" >&2
-            return 1
-        }
-        packages+=("php$version-fpm")
-        for ext in "${PHP_EXTENSIONS[@]}"; do
-            packages+=("php$version-$ext")
-        done
+        php_version_packages_available "$version" "y" || return 1
+        mapfile -t version_packages < <(php_packages_for_version "$version")
+        packages+=("${version_packages[@]}")
     done
 
     apt install -y "${packages[@]}"
@@ -2096,8 +2135,8 @@ site_files() {
 list_sites() {
     local file domain type user php webroot status
 
-    printf '%-28s %-10s %-9s %-16s %-6s %s\n' "Domain" "Type" "Status" "User" "PHP" "Web root"
-    printf '%-28s %-10s %-9s %-16s %-6s %s\n' "------" "----" "------" "----" "---" "--------"
+    printf '%-28s %-10s %-9s %-32s %-6s %s\n' "Domain" "Type" "Status" "User" "PHP" "Web root"
+    printf '%-28s %-10s %-9s %-32s %-6s %s\n' "------" "----" "------" "----" "---" "--------"
 
     while IFS= read -r file; do
         domain=$(metadata_value domain "$file")
@@ -2107,7 +2146,7 @@ list_sites() {
         webroot=$(metadata_value webroot "$file")
         status="disabled"
         [[ -L "$CADDY_ENABLED/$(basename "$file")" ]] && status="enabled"
-        printf '%-28s %-10s %-9s %-16s %-6s %s\n' "$domain" "$type" "$status" "$user" "$php" "$webroot"
+        printf '%-28s %-10s %-9s %-32s %-6s %s\n' "$domain" "$type" "$status" "$user" "$php" "$webroot"
     done < <(site_files)
 }
 
