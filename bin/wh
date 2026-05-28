@@ -8,6 +8,8 @@ CREDENTIALS_DIR="$APP_DIR/sites"
 CADDY_AVAILABLE="/etc/caddy/sites-available"
 CADDY_ENABLED="/etc/caddy/sites-enabled"
 SFTP_GROUP="sftp-sites"
+SFTP_DENIED_REQUESTS="symlink,hardlink"
+SFTP_UMASK="027"
 DEFAULT_TIMEZONE="America/Toronto"
 DEFAULT_LOCALE="en_CA.UTF-8"
 ADMINER_DIR="/usr/share/adminer"
@@ -34,6 +36,7 @@ PHP_EXTENSIONS=(cli mysql curl mbstring xml zip gd intl bcmath soap imagick opca
 PHP_EOL_VERSIONS=(8.1 8.0 7.4 7.3 7.2 7.1 7.0 5.6)
 SENSITIVE_PATH_REGEXP='(?i)(?:(^|/)(?:\.git|\.svn|\.hg)(?:/|$)|(^|/)(?:\.env[^/]*|\.htaccess|\.htpasswd|\.user\.ini|wp-config\.php|composer\.(?:json|lock)|auth\.json|package(?:-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$|\.(?:sql|sqlite3?|db|bak|backup|old|orig|save|sw[op]|tmp)$)'
 STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
+PHP_STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]+|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 UPLOAD_EXECUTABLE_REGEXP='(?i)^/(?:wp-content/uploads|uploads|data|cache)/.*\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 
 require_root() {
@@ -241,13 +244,14 @@ sshd_configured_for_port() {
 sshd_listening_on_port() {
     local port=$1
     local line local_addr found_port=0
+    local -a fields
 
     require_command ss || return 1
 
     while IFS= read -r line; do
-        set -- $line
-        [[ $# -ge 4 ]] || continue
-        local_addr=$4
+        read -r -a fields <<< "$line"
+        [[ ${#fields[@]} -ge 4 ]] || continue
+        local_addr=${fields[3]}
         [[ "$local_addr" == *":$port" ]] || continue
 
         found_port=1
@@ -328,6 +332,13 @@ service_is_active() {
 service_is_enabled() {
     local service=$1
     command_exists systemctl && systemctl is-enabled --quiet "$service" 2>/dev/null
+}
+
+require_caddy_user() {
+    if ! id caddy >/dev/null 2>&1; then
+        echo "Missing caddy system user. Run setup before managing sites." >&2
+        return 1
+    fi
 }
 
 check_conflicting_web_servers() {
@@ -487,6 +498,47 @@ require_managed_or_missing() {
     fi
 }
 
+require_webroot_without_symlinks() {
+    local webroot=$1
+    local first_symlink
+
+    if [[ -L "$webroot" ]]; then
+        echo "Refusing to enable site with a symlinked web root: $webroot" >&2
+        echo "Caddy follows symlinks, which can expose files outside the site root." >&2
+        return 1
+    fi
+    if [[ ! -d "$webroot" ]]; then
+        echo "Missing web root: $webroot" >&2
+        return 1
+    fi
+
+    if ! first_symlink=$(find "$webroot" -type l -print -quit); then
+        echo "Could not scan web root for symlinks: $webroot" >&2
+        return 1
+    fi
+    if [[ -n "$first_symlink" ]]; then
+        echo "Refusing to enable site with a symlink inside the web root: $first_symlink" >&2
+        echo "Caddy follows symlinks, which can expose files outside the site root." >&2
+        return 1
+    fi
+}
+
+require_caddy_config_webroot_safe() {
+    local conf=$1
+    local type webroot
+
+    type=$(metadata_value type "$conf")
+    [[ "$type" == "admin" ]] && return 0
+
+    webroot=$(metadata_value webroot "$conf")
+    if [[ -z "$webroot" ]]; then
+        echo "Managed Caddy config is missing webroot metadata: $conf" >&2
+        return 1
+    fi
+
+    require_webroot_without_symlinks "$webroot"
+}
+
 is_default_caddyfile() {
     local path=$1
     local normalized
@@ -634,7 +686,11 @@ php_socket_ref() {
 
 enable_caddy_config() {
     local conf=$1
-    local enabled="$CADDY_ENABLED/$(basename "$conf")"
+    local enabled
+
+    enabled="$CADDY_ENABLED/$(basename "$conf")"
+
+    require_caddy_config_webroot_safe "$conf" || return 1
 
     backup_file "$enabled"
     ln -sfn "$conf" "$enabled"
@@ -845,7 +901,8 @@ select_installed_php_version() {
 
 prepare_repositories() {
     local codename
-    codename=$(. /etc/os-release && printf '%s\n' "$VERSION_CODENAME")
+
+    codename=$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
 
     apt update
     apt install -y ca-certificates curl gnupg apt-transport-https
@@ -1057,7 +1114,7 @@ Match Group $SFTP_GROUP
     PasswordAuthentication yes
     KbdInteractiveAuthentication no
     ChrootDirectory %h
-    ForceCommand internal-sftp
+    ForceCommand internal-sftp -u $SFTP_UMASK -P $SFTP_DENIED_REQUESTS
     AllowTcpForwarding no
     X11Forwarding no
     PermitTunnel no
@@ -1265,7 +1322,7 @@ setup_server() {
         && ! is_default_caddyfile /etc/caddy/Caddyfile; then
         echo "/etc/caddy/Caddyfile exists and is not managed by encodev-wh-cli." >&2
         echo "Refusing to overwrite it. Move it aside or migrate it manually." >&2
-        return 0
+        return 1
     fi
 
     echo
@@ -1308,6 +1365,7 @@ setup_server() {
     run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
     run_setup_step "Configure Caddy base" configure_caddy_base
     run_setup_step "Create SFTP group" groupadd -f "$SFTP_GROUP"
+    run_setup_step "Configure UFW" configure_ufw "$admin_ip" "$ssh_port"
     run_setup_step "Configure SSH" configure_sshd "$admin_user"
     run_setup_step "Verify active SSH port" require_active_ssh_port "$ssh_port"
     run_setup_step "Configure Fail2ban" configure_fail2ban "$ssh_port"
@@ -1316,7 +1374,6 @@ setup_server() {
     run_setup_step "Install Adminer" install_adminer "$admin_host" "$admin_ip" "$primary_php"
     run_setup_step "Validate Caddy" caddy validate --config /etc/caddy/Caddyfile
     run_setup_step "Reload Caddy" systemctl reload caddy
-    run_setup_step "Configure UFW" configure_ufw "$admin_ip" "$ssh_port"
     run_setup_step "Prune backups" prune_backups
 
     trap - ERR
@@ -1419,6 +1476,7 @@ create_site_user() {
     local password=$3
 
     groupadd -f "$SFTP_GROUP"
+    require_caddy_user || return 1
     if ! id "$username" >/dev/null 2>&1; then
         useradd -U -d "$home" -s /usr/sbin/nologin -G "$SFTP_GROUP" "$username" || return 1
     fi
@@ -1427,23 +1485,23 @@ create_site_user() {
 
     mkdir -p "$home/public_html" "$home/logs" "$home/tmp" || return 1
     chown root:root "$home" || return 1
-    chmod 755 "$home" || return 1
-    chown "$username:$username" "$home/public_html" "$home/tmp" || return 1
-    chmod 755 "$home/public_html" || return 1
+    chmod 751 "$home" || return 1
+    chown "$username:caddy" "$home/public_html" || return 1
+    chmod 2750 "$home/public_html" || return 1
+    chown "$username:$username" "$home/tmp" || return 1
     chmod 700 "$home/tmp" || return 1
 
     chown root:root "$home/logs" || return 1
-    chmod 755 "$home/logs" || return 1
+    chmod 751 "$home/logs" || return 1
 }
 
 prepare_logs() {
     local username=$1
     local home=$2
 
+    require_caddy_user || return 1
     touch "$home/logs/access.log" "$home/logs/error.log" "$home/logs/php-error.log" || return 1
-    if id caddy >/dev/null 2>&1; then
-        chown "caddy:$username" "$home/logs/access.log" "$home/logs/error.log" || return 1
-    fi
+    chown "caddy:$username" "$home/logs/access.log" "$home/logs/error.log" || return 1
     chown "$username:$username" "$home/logs/php-error.log" || return 1
     chmod 640 "$home/logs/access.log" "$home/logs/error.log" "$home/logs/php-error.log" || return 1
 }
@@ -1498,17 +1556,19 @@ fix_site_permissions() {
     [[ -d "$webroot" ]] || return 1
 
     chown root:root "$home" || return 1
-    chmod 755 "$home" || return 1
+    chmod 751 "$home" || return 1
 
-    chown -R "$username:$username" "$webroot" || return 1
-    find "$webroot" -type d -exec chmod 755 {} + || return 1
-    find "$webroot" -type f -exec chmod 644 {} + || return 1
+    require_webroot_without_symlinks "$webroot" || return 1
+    require_caddy_user || return 1
+    chown -R "$username:caddy" "$webroot" || return 1
+    find "$webroot" -type d -exec chmod 2750 {} + || return 1
+    find "$webroot" -type f -exec chmod 640 {} + || return 1
 
     chown "$username:$username" "$home/tmp" || return 1
     chmod 700 "$home/tmp" || return 1
 
     chown root:root "$home/logs" || return 1
-    chmod 755 "$home/logs" || return 1
+    chmod 751 "$home/logs" || return 1
     prepare_logs "$username" "$home"
 }
 
@@ -1775,6 +1835,10 @@ create_caddy_site() {
         path_regexp blocked_upload_executables $UPLOAD_EXECUTABLE_REGEXP
     }
     respond @blocked_upload_executables \"Forbidden\" 403
+    @executable_static_files {
+        path_regexp executable_static_files $PHP_STATIC_EXECUTABLE_REGEXP
+    }
+    respond @executable_static_files \"Not Found\" 404
     try_files {path} {path}/ /index.php?{query}
     php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
     file_server
@@ -2163,7 +2227,9 @@ rollback_php_version_change() {
 
     systemctl restart "php${old_php}-fpm" || true
     systemctl restart "php${new_php}-fpm" || true
-    [[ "$status" == "enabled" ]] && systemctl reload caddy || true
+    if [[ "$status" == "enabled" ]]; then
+        systemctl reload caddy || true
+    fi
 }
 
 change_site_php_version() {
@@ -2491,7 +2557,7 @@ scan_server() {
 }
 
 scan_site() {
-    local file domain type user php webroot home status upload_hits htaccess_hits hardcoded_hits pool
+    local file domain type user php webroot home status symlink_hits upload_hits executable_hits htaccess_hits hardcoded_hits pool
     local wp_home wp_cache
 
     file=$(select_site_file) || return 0
@@ -2515,6 +2581,17 @@ scan_site() {
 
     [[ -d "$webroot" ]] || { echo "Missing web root."; return 0; }
 
+    if [[ -L "$webroot" ]]; then
+        symlink_hits=$webroot
+    else
+        symlink_hits=$(find "$webroot" -type l -print 2>/dev/null | head -n 5 || true)
+    fi
+    if [[ -n "$symlink_hits" ]]; then
+        echo "Symlinks found in web root; managed sites refuse to enable with symlinks:"
+        echo "$symlink_hits"
+        echo
+    fi
+
     if [[ "$type" != "static" ]]; then
         validate_php_version "$php" || {
             echo "Invalid PHP version for $domain: $php"
@@ -2530,6 +2607,21 @@ scan_site() {
         fi
     fi
 
+    if [[ "$type" == "static" ]]; then
+        executable_hits=$(find "$webroot" -type f 2>/dev/null \
+            | awk 'tolower($0) ~ /\.(php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$/ { print }' \
+            | head -n 5 || true)
+    else
+        executable_hits=$(find "$webroot" -type f 2>/dev/null \
+            | awk 'tolower($0) ~ /\.(php[0-9]+|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$/ { print }' \
+            | head -n 5 || true)
+    fi
+    if [[ -n "$executable_hits" ]]; then
+        echo "Static executable-like files found:"
+        echo "$executable_hits"
+        echo
+    fi
+
     htaccess_hits=$(find "$webroot" -name .htaccess -type f 2>/dev/null | head -n 5 || true)
     if [[ -n "$htaccess_hits" ]]; then
         echo ".htaccess files found; Caddy ignores them:"
@@ -2538,9 +2630,11 @@ scan_site() {
     fi
 
     upload_hits=$(find "$webroot/wp-content/uploads" "$webroot/uploads" "$webroot/data" "$webroot/cache" \
-        -type f -name '*.php' 2>/dev/null | head -n 5 || true)
+        -type f 2>/dev/null \
+        | awk 'tolower($0) ~ /\.(php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$/ { print }' \
+        | head -n 5 || true)
     if [[ -n "$upload_hits" ]]; then
-        echo "PHP files found in upload/data/cache paths:"
+        echo "Executable-like files found in upload/data/cache paths:"
         echo "$upload_hits"
         echo
     fi
