@@ -1586,6 +1586,51 @@ prepare_wp_cli_runtime() {
     chmod 700 "$wp_home" "$wp_cache" || return 1
 }
 
+run_wp_cli_for_site() {
+    local username=$1
+    local home=$2
+    local webroot=$3
+    local wp_home="$home/tmp"
+    local wp_cache="$wp_home/wp-cli-cache"
+    shift 3
+
+    runuser -u "$username" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" "$@"
+}
+
+wp_cli_probe_works() {
+    local username=$1
+    local home=$2
+    local webroot=$3
+    shift 3
+
+    run_wp_cli_for_site "$username" "$home" "$webroot" "$@" core version >/dev/null 2>&1
+}
+
+run_wp_cli_site_checks() {
+    local username=$1
+    local home=$2
+    local webroot=$3
+    local -a wp_args=()
+
+    if wp_cli_probe_works "$username" "$home" "$webroot"; then
+        wp_args=()
+    elif wp_cli_probe_works "$username" "$home" "$webroot" --skip-themes; then
+        echo "WP-CLI normal bootstrap failed; retrying checks with --skip-themes."
+        wp_args=(--skip-themes)
+    elif wp_cli_probe_works "$username" "$home" "$webroot" --skip-themes --skip-plugins; then
+        echo "WP-CLI normal bootstrap failed; retrying checks with --skip-themes --skip-plugins."
+        wp_args=(--skip-themes --skip-plugins)
+    else
+        echo "WP-CLI checks failed with normal bootstrap, --skip-themes, and --skip-themes --skip-plugins."
+        return 0
+    fi
+
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" core version 2>/dev/null || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get siteurl 2>/dev/null || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get home 2>/dev/null || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" plugin list --status=active 2>/dev/null || true
+}
+
 fix_site_permissions() {
     local username=$1
     local home=$2
@@ -2597,7 +2642,6 @@ scan_server() {
 
 scan_site() {
     local file domain type user php webroot home status symlink_hits upload_hits executable_hits htaccess_hits hardcoded_hits pool
-    local wp_home wp_cache
 
     file=$(select_site_file) || return 0
     domain=$(metadata_value domain "$file")
@@ -2688,13 +2732,8 @@ scan_site() {
 
     if [[ -f "$webroot/wp-config.php" ]] && command_exists wp; then
         echo "WordPress detected. Running WP-CLI checks as $user..."
-        wp_home="$home/tmp"
-        wp_cache="$wp_home/wp-cli-cache"
         if prepare_wp_cli_runtime "$user" "$home"; then
-            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" core version 2>/dev/null || true
-            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" option get siteurl 2>/dev/null || true
-            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" option get home 2>/dev/null || true
-            runuser -u "$user" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" plugin list --status=active 2>/dev/null || true
+            run_wp_cli_site_checks "$user" "$home" "$webroot"
         else
             echo "Could not prepare WP-CLI cache under $home/tmp; skipping WP-CLI checks."
         fi
