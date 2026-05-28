@@ -31,6 +31,7 @@ MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
 MANAGED_END="# END encodev-wh-cli managed"
 DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
 PHP_EXTENSIONS=(cli mysql curl mbstring xml zip gd intl bcmath soap imagick opcache)
+PHP_EOL_VERSIONS=(8.1 8.0 7.4 7.3 7.2 7.1 7.0 5.6)
 SENSITIVE_PATH_REGEXP='(?i)(?:(^|/)(?:\.git|\.svn|\.hg)(?:/|$)|(^|/)(?:\.env[^/]*|\.htaccess|\.htpasswd|\.user\.ini|wp-config\.php|composer\.(?:json|lock)|auth\.json|package(?:-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$|\.(?:sql|sqlite3?|db|bak|backup|old|orig|save|sw[op]|tmp)$)'
 STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 UPLOAD_EXECUTABLE_REGEXP='(?i)^/(?:wp-content/uploads|uploads|data|cache)/.*\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
@@ -110,6 +111,11 @@ validate_ipv4() {
 validate_port() {
     local port=$1
     [[ "$port" =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 ))
+}
+
+validate_php_version() {
+    local version=$1
+    [[ "$version" =~ ^[0-9]+[.][0-9]+$ ]]
 }
 
 validate_domain() {
@@ -361,6 +367,111 @@ is_managed_file() {
     [[ -f "$path" ]] && grep -q '^# Managed by encodev-wh-cli' "$path"
 }
 
+is_managed_php_pool() {
+    local path=$1
+    [[ -f "$path" ]] && grep -q '^; Managed by encodev-wh-cli' "$path"
+}
+
+require_managed_php_pool_or_missing() {
+    local path=$1
+    local label=$2
+
+    if path_exists "$path" && ! is_managed_php_pool "$path"; then
+        echo "$label exists and is not managed by encodev-wh-cli: $path" >&2
+        echo "Refusing to overwrite or move it." >&2
+        return 1
+    fi
+}
+
+remove_managed_php_pool_if_exists() {
+    local path=$1
+
+    path_exists "$path" || return 0
+    if ! is_managed_php_pool "$path"; then
+        echo "Refusing to remove unmanaged PHP-FPM pool: $path" >&2
+        return 0
+    fi
+    if ! rm -f "$path"; then
+        echo "Failed to remove managed PHP-FPM pool: $path" >&2
+    fi
+}
+
+metadata_value() {
+    local key=$1
+    local file=$2
+
+    sed -n "s/^# $key: //p" "$file" | head -n 1
+}
+
+managed_caddy_files() {
+    local file
+
+    [[ -d "$CADDY_AVAILABLE" ]] || return 0
+
+    shopt -s nullglob
+    for file in "$CADDY_AVAILABLE"/*; do
+        [[ -f "$file" ]] || continue
+        grep -q '^# Managed by encodev-wh-cli' "$file" || continue
+        printf '%s\n' "$file"
+    done
+    shopt -u nullglob
+}
+
+caddy_claimed_hosts_for_metadata() {
+    local domain=$1
+    local type=$2
+    local www_policy=${3:-none}
+
+    [[ -n "$domain" ]] || return 0
+
+    printf '%s\n' "$domain"
+    if [[ "$type" == "admin" || "$domain" == www.* ]]; then
+        return 0
+    fi
+
+    case "$www_policy" in
+        redirect_www|redirect_apex|serve_both)
+            printf 'www.%s\n' "$domain"
+            ;;
+    esac
+}
+
+caddy_config_claims_host() {
+    local file=$1
+    local requested_host=$2
+    local domain type www_policy host
+
+    domain=$(metadata_value domain "$file")
+    type=$(metadata_value type "$file")
+    www_policy=$(metadata_value www "$file")
+
+    while IFS= read -r host; do
+        [[ "$host" == "$requested_host" ]] && return 0
+    done < <(caddy_claimed_hosts_for_metadata "$domain" "$type" "$www_policy")
+
+    return 1
+}
+
+require_caddy_hosts_available() {
+    local domain=$1
+    local type=$2
+    local www_policy=${3:-none}
+    local skip_file=${4:-}
+    local requested_host file failed=0
+
+    while IFS= read -r requested_host; do
+        while IFS= read -r file; do
+            [[ -n "$skip_file" && "$file" == "$skip_file" ]] && continue
+            if caddy_config_claims_host "$file" "$requested_host"; then
+                echo "Hostname already claimed by managed Caddy config: $requested_host ($file)" >&2
+                failed=1
+            fi
+        done < <(managed_caddy_files)
+    done < <(caddy_claimed_hosts_for_metadata "$domain" "$type" "$www_policy")
+
+    (( failed == 0 ))
+}
+
 path_exists() {
     [[ -e "$1" || -L "$1" ]]
 }
@@ -378,7 +489,18 @@ require_managed_or_missing() {
 
 is_default_caddyfile() {
     local path=$1
-    [[ -f "$path" ]] && grep -q '/usr/share/caddy' "$path" && grep -q 'file_server' "$path"
+    local normalized
+
+    [[ -f "$path" ]] || return 1
+
+    normalized=$(sed -E \
+        -e 's/[[:space:]]*#.*$//' \
+        -e 's/^[[:space:]]+//' \
+        -e 's/[[:space:]]+$//' \
+        -e '/^$/d' \
+        "$path")
+
+    [[ "$normalized" == $':80 {\nroot * /usr/share/caddy\nfile_server\n}' ]]
 }
 
 restore_file_from_backup() {
@@ -498,6 +620,15 @@ ensure_apt_keyring() {
 php_socket_ref() {
     local php_version=$1
     local username=$2
+
+    validate_php_version "$php_version" || {
+        echo "Invalid PHP version: $php_version" >&2
+        return 1
+    }
+    validate_username "$username" || {
+        echo "Invalid username: $username" >&2
+        return 1
+    }
     printf 'unix//run/php/php%s-fpm-%s.sock\n' "$php_version" "$username"
 }
 
@@ -609,27 +740,35 @@ service_state() {
 }
 
 installed_php_versions() {
-    local dir
+    local dir version
     for dir in /etc/php/*/fpm; do
         [[ -d "$dir" ]] || continue
-        basename "$(dirname "$dir")"
+        version=$(basename "$(dirname "$dir")")
+        validate_php_version "$version" || continue
+        printf '%s\n' "$version"
     done | sort -Vr
 }
 
 available_php_versions() {
+    local version
+
     apt-cache search '^php[0-9]+\.[0-9]+-fpm$' 2>/dev/null \
         | awk '{print $1}' \
         | sed -E 's/^php([0-9]+\.[0-9]+)-fpm$/\1/' \
+        | while IFS= read -r version; do
+            validate_php_version "$version" || continue
+            printf '%s\n' "$version"
+        done \
         | sort -Vr
 }
 
 php_is_eol() {
     local version=$1
-    local major=${version%%.*}
-    local minor=${version#*.}
+    local eol_version
 
-    (( major < 8 )) && return 0
-    (( major == 8 && minor < 2 )) && return 0
+    for eol_version in "${PHP_EOL_VERSIONS[@]}"; do
+        [[ "$version" == "$eol_version" ]] && return 0
+    done
     return 1
 }
 
@@ -727,6 +866,10 @@ install_php_versions() {
     local version ext packages=()
 
     for version in "${SELECTED_PHP_VERSIONS[@]}"; do
+        validate_php_version "$version" || {
+            echo "Invalid PHP version: $version" >&2
+            return 1
+        }
         packages+=("php$version-fpm")
         for ext in "${PHP_EXTENSIONS[@]}"; do
             packages+=("php$version-$ext")
@@ -772,22 +915,62 @@ configure_timezone_and_locales() {
     update-locale "LANG=$DEFAULT_LOCALE"
 }
 
+ufw_is_active() {
+    ufw status 2>/dev/null | grep -q '^Status: active$'
+}
+
+restore_ufw_rules_from_backup() {
+    local was_active=${1:-0}
+
+    restore_file_from_backup /etc/ufw/user.rules
+    restore_file_from_backup /etc/ufw/user6.rules
+
+    if [[ "$was_active" == "1" ]]; then
+        ufw reload >/dev/null 2>&1 || ufw --force enable >/dev/null 2>&1 || true
+    else
+        ufw --force disable >/dev/null 2>&1 || true
+    fi
+}
+
 configure_ufw() {
     local admin_ip=$1
     local ssh_port=$2
+    local ufw_was_active=0
 
     require_active_ssh_port "$ssh_port" || return 1
+    ufw_is_active && ufw_was_active=1
 
     backup_file /etc/ufw/user.rules
     backup_file /etc/ufw/user6.rules
 
-    ufw --force reset
-    ufw default deny incoming
-    ufw default allow outgoing
-    ufw allow from "$admin_ip" to any port "$ssh_port" proto tcp comment 'encodev admin ssh'
-    ufw allow 80/tcp comment 'encodev http'
-    ufw allow 443/tcp comment 'encodev https'
-    ufw --force enable
+    if ! ufw --force reset; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw default deny incoming; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw default allow outgoing; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw allow from "$admin_ip" to any port "$ssh_port" proto tcp comment 'encodev admin ssh'; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw allow 80/tcp comment 'encodev http'; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw allow 443/tcp comment 'encodev https'; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
+    if ! ufw --force enable; then
+        restore_ufw_rules_from_backup "$ufw_was_active"
+        return 1
+    fi
 }
 
 configure_fail2ban() {
@@ -933,7 +1116,14 @@ install_wp_cli() {
 create_adminer_pool() {
     local php_version=$1
     local user=wwwadminer
-    local pool="/etc/php/$php_version/fpm/pool.d/encodev-adminer.conf"
+    local pool
+
+    validate_php_version "$php_version" || {
+        echo "Invalid PHP version: $php_version" >&2
+        return 1
+    }
+    pool="/etc/php/$php_version/fpm/pool.d/adminer.conf"
+    require_managed_php_pool_or_missing "$pool" "Adminer PHP-FPM pool" || return 1
 
     if ! id "$user" >/dev/null 2>&1; then
         useradd -r -U -d "$ADMINER_DIR" -s /usr/sbin/nologin "$user" || return 1
@@ -949,7 +1139,7 @@ create_adminer_pool() {
 
     write_file "$pool" <<EOF
 ; Managed by encodev-wh-cli
-[encodev-adminer]
+[adminer]
 user = $user
 group = $user
 listen = /run/php/php$php_version-fpm-adminer.sock
@@ -984,6 +1174,7 @@ install_adminer() {
         echo "Admin Caddy config exists and is not managed: $conf" >&2
         return 1
     fi
+    require_caddy_hosts_available "$admin_host" "admin" "none" "$conf" || return 1
 
     mkdir -p "$ADMINER_DIR" || return 1
     download_verified_github_asset "$ADMINER_ASSET" "$ADMINER_URL" "$ADMINER_ASSET_SHA256" "$ADMINER_FILE" || return 1
@@ -1325,11 +1516,22 @@ create_php_pool() {
     local username=$1
     local home=$2
     local php_version=$3
-    local pool="/etc/php/$php_version/fpm/pool.d/encodev-$username.conf"
+    local pool
+
+    validate_php_version "$php_version" || {
+        echo "Invalid PHP version: $php_version" >&2
+        return 1
+    }
+    validate_username "$username" || {
+        echo "Invalid username: $username" >&2
+        return 1
+    }
+    pool="/etc/php/$php_version/fpm/pool.d/$username.conf"
+    require_managed_php_pool_or_missing "$pool" "PHP-FPM pool" || return 1
 
     write_file "$pool" <<EOF
 ; Managed by encodev-wh-cli
-[encodev-$username]
+[$username]
 user = $username
 group = $username
 listen = /run/php/php$php_version-fpm-$username.sock
@@ -1399,6 +1601,7 @@ ensure_site_can_be_created() {
     local create_db=$6
     local db_name=$7
     local db_user=$8
+    local www_policy=${9:-none}
     local conf="$CADDY_AVAILABLE/$domain"
     local enabled="$CADDY_ENABLED/$domain"
     local pool
@@ -1424,10 +1627,18 @@ ensure_site_can_be_created() {
         echo "Home directory already exists: $home" >&2
         failed=1
     fi
+    if ! require_caddy_hosts_available "$domain" "$type" "$www_policy" "$conf"; then
+        failed=1
+    fi
 
     if [[ "$type" != "static" ]]; then
-        pool=$(pool_path_for "$php_version" "$username")
-        if path_exists "$pool" || path_exists "$pool.disabled"; then
+        if ! validate_php_version "$php_version"; then
+            echo "Invalid PHP version: $php_version" >&2
+            failed=1
+        else
+            pool=$(pool_path_for "$php_version" "$username")
+        fi
+        if [[ -n "${pool:-}" ]] && { path_exists "$pool" || path_exists "$pool.disabled"; }; then
             echo "PHP-FPM pool already exists for $username on PHP $php_version." >&2
             failed=1
         fi
@@ -1472,7 +1683,8 @@ rollback_add_site() {
 
     if [[ "$type" != "static" ]]; then
         pool=$(pool_path_for "$php_version" "$username")
-        rm -f "$pool" "$pool.disabled"
+        remove_managed_php_pool_if_exists "$pool"
+        remove_managed_php_pool_if_exists "$pool.disabled"
         systemctl restart "php${php_version}-fpm" || true
     fi
 
@@ -1512,6 +1724,12 @@ create_caddy_site() {
 
     if [[ "$domain" == www.* ]]; then
         www_policy="none"
+    fi
+    if [[ "$type" != "static" ]]; then
+        validate_php_version "$php_version" || {
+            echo "Invalid PHP version: $php_version" >&2
+            return 1
+        }
     fi
 
     case "$www_policy" in
@@ -1647,6 +1865,10 @@ update_site_credentials_php_version() {
     local file="$CREDENTIALS_DIR/$domain.txt"
     local tmp
 
+    validate_php_version "$php_version" || {
+        echo "Invalid PHP version: $php_version" >&2
+        return 1
+    }
     [[ -f "$file" ]] || return 0
     backup_file "$file" || return 1
     tmp=$(mktemp)
@@ -1708,7 +1930,7 @@ add_site() {
         db_pass=$(random_secret) || return 1
     fi
 
-    if ! ensure_site_can_be_created "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"; then
+    if ! ensure_site_can_be_created "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user" "$www_policy"; then
         echo "Site creation stopped because of the conflicts above."
         return 0
     fi
@@ -1799,20 +2021,12 @@ add_site() {
 }
 
 site_files() {
-    shopt -s nullglob
-    for file in "$CADDY_AVAILABLE"/*; do
-        [[ -f "$file" ]] || continue
-        grep -q '^# Managed by encodev-wh-cli' "$file" || continue
+    local file
+
+    while IFS= read -r file; do
         grep -q '^# type: admin' "$file" && continue
         printf '%s\n' "$file"
-    done
-    shopt -u nullglob
-}
-
-metadata_value() {
-    local key=$1
-    local file=$2
-    sed -n "s/^# $key: //p" "$file" | head -n 1
+    done < <(managed_caddy_files)
 }
 
 list_sites() {
@@ -1859,7 +2073,16 @@ select_site_file() {
 pool_path_for() {
     local php=$1
     local user=$2
-    printf '/etc/php/%s/fpm/pool.d/encodev-%s.conf\n' "$php" "$user"
+
+    validate_php_version "$php" || {
+        echo "Invalid PHP version: $php" >&2
+        return 1
+    }
+    validate_username "$user" || {
+        echo "Invalid username: $user" >&2
+        return 1
+    }
+    printf '/etc/php/%s/fpm/pool.d/%s.conf\n' "$php" "$user"
 }
 
 update_caddy_php_version() {
@@ -1870,6 +2093,14 @@ update_caddy_php_version() {
     local escaped_old_php
     local tmp
 
+    validate_php_version "$old_php" || {
+        echo "Invalid current PHP version: $old_php" >&2
+        return 1
+    }
+    validate_php_version "$new_php" || {
+        echo "Invalid new PHP version: $new_php" >&2
+        return 1
+    }
     escaped_old_php=${old_php//./\\.}
     tmp=$(mktemp)
     if ! sed -E \
@@ -1921,13 +2152,13 @@ rollback_php_version_change() {
     if path_exists "$(backup_path_for "$new_pool")"; then
         restore_file_from_backup "$new_pool"
     else
-        rm -f "$new_pool"
+        remove_managed_php_pool_if_exists "$new_pool"
     fi
 
     if path_exists "$(backup_path_for "$new_pool_disabled")"; then
         restore_file_from_backup "$new_pool_disabled"
     else
-        rm -f "$new_pool_disabled"
+        remove_managed_php_pool_if_exists "$new_pool_disabled"
     fi
 
     systemctl restart "php${old_php}-fpm" || true
@@ -1953,8 +2184,16 @@ change_site_php_version() {
         echo "$domain is a static site and does not use PHP-FPM."
         return 0
     fi
+    validate_php_version "$old_php" || {
+        echo "Invalid current PHP version for $domain: $old_php" >&2
+        return 1
+    }
 
     new_php=$(select_installed_php_version) || return 0
+    validate_php_version "$new_php" || {
+        echo "Invalid selected PHP version: $new_php" >&2
+        return 1
+    }
     if [[ "$new_php" == "$old_php" ]]; then
         echo "$domain already uses PHP $new_php."
         return 0
@@ -1981,6 +2220,11 @@ change_site_php_version() {
     old_pool_disabled="$old_pool.disabled"
     new_pool_disabled="$new_pool.disabled"
     timestamp=$(date +%Y%m%d-%H%M%S)
+
+    require_managed_php_pool_or_missing "$old_pool" "Current PHP-FPM pool" || return 1
+    require_managed_php_pool_or_missing "$old_pool_disabled" "Disabled current PHP-FPM pool" || return 1
+    require_managed_php_pool_or_missing "$new_pool" "Target PHP-FPM pool" || return 1
+    require_managed_php_pool_or_missing "$new_pool_disabled" "Disabled target PHP-FPM pool" || return 1
 
     [[ -f "$old_pool" ]] && backup_file "$old_pool"
     [[ -f "$old_pool_disabled" ]] && backup_file "$old_pool_disabled"
@@ -2062,6 +2306,19 @@ disable_site() {
         echo "$domain is already disabled."
         return 0
     fi
+    if [[ "$type" != "static" ]]; then
+        validate_php_version "$php" || {
+            echo "Invalid PHP version for $domain: $php" >&2
+            return 1
+        }
+        pool=$(pool_path_for "$php" "$user") || return 1
+        if path_exists "$pool"; then
+            require_managed_php_pool_or_missing "$pool" "PHP-FPM pool" || return 1
+        fi
+        if path_exists "$pool.disabled"; then
+            require_managed_php_pool_or_missing "$pool.disabled" "Disabled PHP-FPM pool" || return 1
+        fi
+    fi
 
     start_backup_run
     backup_file "$file"
@@ -2081,11 +2338,10 @@ disable_site() {
     fi
 
     if [[ "$type" != "static" ]]; then
-        pool=$(pool_path_for "$php" "$user")
-        if [[ -f "$pool" ]]; then
+        if path_exists "$pool"; then
             backup_file "$pool"
             timestamp=$(date +%Y%m%d-%H%M%S)
-            if [[ -f "$pool.disabled" ]]; then
+            if path_exists "$pool.disabled"; then
                 backup_file "$pool.disabled"
                 mv "$pool.disabled" "$pool.disabled.$timestamp"
             fi
@@ -2102,6 +2358,7 @@ disable_site() {
 
 enable_site() {
     local file domain type user php pool pool_enabled=0
+    local pool_replaced="" timestamp
 
     file=$(select_site_file) || return 0
     domain=$(metadata_value domain "$file")
@@ -2112,30 +2369,57 @@ enable_site() {
     if ! confirm "Enable $domain?" "y"; then
         return 0
     fi
-
-    start_backup_run
-
     if [[ "$type" != "static" ]]; then
-        pool=$(pool_path_for "$php" "$user")
-        if [[ -f "$pool.disabled" ]]; then
-            backup_file "$pool.disabled"
-            mv "$pool.disabled" "$pool"
-            pool_enabled=1
-            if ! systemctl restart "php${php}-fpm"; then
-                mv "$pool" "$pool.disabled"
-                echo "PHP-FPM restart failed. Site was not enabled." >&2
-                return 1
+        validate_php_version "$php" || {
+            echo "Invalid PHP version for $domain: $php" >&2
+            return 1
+        }
+        pool=$(pool_path_for "$php" "$user") || return 1
+        if path_exists "$pool.disabled"; then
+            require_managed_php_pool_or_missing "$pool.disabled" "Disabled PHP-FPM pool" || return 1
+            if path_exists "$pool"; then
+                require_managed_php_pool_or_missing "$pool" "PHP-FPM pool" || return 1
             fi
-        elif [[ ! -f "$pool" ]]; then
+        elif path_exists "$pool"; then
+            require_managed_php_pool_or_missing "$pool" "PHP-FPM pool" || return 1
+        else
             echo "Missing PHP-FPM pool for $domain: $pool" >&2
             echo "Use Change site PHP version or recreate the managed pool before enabling." >&2
             return 1
         fi
     fi
 
+    start_backup_run
+
+    if [[ "$type" != "static" ]]; then
+        if path_exists "$pool.disabled"; then
+            backup_file "$pool.disabled"
+            if path_exists "$pool"; then
+                backup_file "$pool"
+                timestamp=$(date +%Y%m%d-%H%M%S)
+                pool_replaced="$pool.replaced.$timestamp"
+                mv "$pool" "$pool_replaced" || return 1
+            fi
+            mv "$pool.disabled" "$pool"
+            pool_enabled=1
+            if ! systemctl restart "php${php}-fpm"; then
+                mv "$pool" "$pool.disabled" || true
+                if [[ -n "$pool_replaced" ]]; then
+                    mv "$pool_replaced" "$pool" || true
+                fi
+                systemctl restart "php${php}-fpm" || true
+                echo "PHP-FPM restart failed. Site was not enabled." >&2
+                return 1
+            fi
+        fi
+    fi
+
     if ! enable_caddy_config "$file"; then
         if [[ "$pool_enabled" -eq 1 ]]; then
-            mv "$pool" "$pool.disabled"
+            mv "$pool" "$pool.disabled" || true
+            if [[ -n "$pool_replaced" ]]; then
+                mv "$pool_replaced" "$pool" || true
+            fi
             systemctl restart "php${php}-fpm" || true
         fi
         echo "Caddy validation or reload failed. Site was not enabled."
@@ -2232,6 +2516,10 @@ scan_site() {
     [[ -d "$webroot" ]] || { echo "Missing web root."; return 0; }
 
     if [[ "$type" != "static" ]]; then
+        validate_php_version "$php" || {
+            echo "Invalid PHP version for $domain: $php"
+            return 0
+        }
         pool=$(pool_path_for "$php" "$user")
         if [[ ! -f "$pool" && "$status" == "enabled" ]]; then
             echo "Missing active PHP-FPM pool for enabled site: $pool"
@@ -2362,4 +2650,6 @@ main() {
     main_menu
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

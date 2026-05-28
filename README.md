@@ -12,7 +12,9 @@ Run it as root:
 sudo wh
 ```
 
-## Install
+## Internal Install
+
+For authorized Encodev internal use only:
 
 ```bash
 sudo curl -fsSL https://raw.githubusercontent.com/encodev/encodev-wh-cli/master/bin/wh -o /usr/local/bin/wh
@@ -27,8 +29,8 @@ License: source-available for reference only. All rights reserved by Encodev.
 - Sets up a fresh Debian web server.
 - Uses Debian's Caddy package only, with automatic HTTPS.
 - Refuses setup when Apache or Nginx is active or enabled.
-- Restricts the SSH port to one whitelisted IPv4 with UFW.
-- Hardens SSH while preserving non-root admin access.
+- Enables SSH password auth for non-root users while disabling root SSH login.
+- Restricts the SSH port to one whitelisted admin IPv4 with UFW.
 - Installs simple Fail2ban SSH protection.
 - Installs selectable PHP-FPM versions from Sury.
 - Installs MariaDB with root socket authentication.
