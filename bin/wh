@@ -8,6 +8,9 @@ CREDENTIALS_DIR="$APP_DIR/sites"
 CADDY_AVAILABLE="/etc/caddy/sites-available"
 CADDY_ENABLED="/etc/caddy/sites-enabled"
 LOGROTATE_CONFIG="/etc/logrotate.d/encodev-wh-cli"
+MAINTENANCE_CRON_CONFIG="/etc/cron.d/encodev-wh-cli-maintenance"
+MAINTENANCE_RETENTION_DAYS=7
+MAINTENANCE_RETENTION_MINUTES=$((MAINTENANCE_RETENTION_DAYS * 24 * 60))
 SFTP_GROUP="sftp-sites"
 SFTP_DENIED_REQUESTS="symlink,hardlink"
 SFTP_UMASK="027"
@@ -1391,9 +1394,20 @@ configure_logrotate() {
 EOF
 }
 
+configure_maintenance_cron() {
+    write_file "$MAINTENANCE_CRON_CONFIG" <<'EOF'
+# Managed by encodev-wh-cli
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 4 * * * root /usr/local/bin/wh maintenance
+EOF
+}
+
 install_base_packages() {
-    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server iproute2 logrotate
+    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server iproute2 logrotate cron
     systemctl enable caddy --now
+    systemctl enable cron --now
 }
 
 setup_server() {
@@ -1479,6 +1493,7 @@ setup_server() {
     run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
     run_setup_step "Configure Caddy base" configure_caddy_base
     run_setup_step "Configure logrotate" configure_logrotate
+    run_setup_step "Configure maintenance cron" configure_maintenance_cron
     run_setup_step "Create SFTP group" groupadd -f "$SFTP_GROUP"
     run_setup_step "Configure UFW" configure_ufw "$admin_ip" "$ssh_port"
     run_setup_step "Configure SSH" configure_sshd "$admin_user"
@@ -2846,6 +2861,73 @@ scan_site() {
     echo "Scan complete."
 }
 
+is_managed_tmp_dir() {
+    local dir=$1
+
+    if [[ "$dir" == "$ADMINER_TMP_DIR" ]]; then
+        return 0
+    fi
+    [[ "$dir" =~ ^/home/site_[a-z0-9_-]+/tmp$ ]]
+}
+
+cleanup_tmp_dir() {
+    local dir=$1
+    local label=$2
+    local file_count dir_count
+
+    if ! is_managed_tmp_dir "$dir"; then
+        echo "Refusing unexpected tmp directory: $dir" >&2
+        return 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        printf '  %-36s skipped (missing)\n' "$label"
+        return 0
+    fi
+    if [[ -L "$dir" ]]; then
+        echo "Refusing symlinked tmp directory: $dir" >&2
+        return 1
+    fi
+
+    if ! file_count=$(find "$dir" -xdev -ignore_readdir_race -type f -mmin +"$MAINTENANCE_RETENTION_MINUTES" -delete -printf '.' | wc -c); then
+        echo "Failed to clean stale files under: $dir" >&2
+        return 1
+    fi
+    file_count=${file_count//[[:space:]]/}
+    if ! dir_count=$(find "$dir" -xdev -ignore_readdir_race -mindepth 1 -type d -empty -mmin +"$MAINTENANCE_RETENTION_MINUTES" -delete -printf '.' | wc -c); then
+        echo "Failed to clean empty directories under: $dir" >&2
+        return 1
+    fi
+    dir_count=${dir_count//[[:space:]]/}
+
+    printf '  %-36s %s files, %s empty dirs\n' "$label" "$file_count" "$dir_count"
+}
+
+run_maintenance() {
+    local dir label failed=0
+    local nullglob_was_set=0
+
+    echo "Maintenance cleanup"
+    echo "Retention: $MAINTENANCE_RETENTION_DAYS days"
+
+    shopt -q nullglob && nullglob_was_set=1
+    shopt -s nullglob
+    for dir in /home/site_*/tmp; do
+        label=${dir#/home/}
+        cleanup_tmp_dir "$dir" "$label" || failed=1
+    done
+    if (( nullglob_was_set == 0 )); then
+        shopt -u nullglob
+    fi
+
+    cleanup_tmp_dir "$ADMINER_TMP_DIR" "adminer-tmp" || failed=1
+
+    if (( failed != 0 )); then
+        echo "Maintenance completed with errors." >&2
+        return 1
+    fi
+    echo "Maintenance complete."
+}
+
 print_status() {
     local enabled disabled
     local php_versions
@@ -2910,13 +2992,26 @@ main_menu() {
 
 main() {
     require_root
-    ensure_app_dirs
 
     if (( $# > 0 )); then
-        echo "This CLI is interactive for now. Run without arguments: sudo wh"
-        exit 1
+        case "$1" in
+            maintenance)
+                shift
+                if (( $# != 0 )); then
+                    echo "Usage: sudo wh maintenance" >&2
+                    exit 1
+                fi
+                run_maintenance
+                exit $?
+                ;;
+            *)
+                echo "Usage: sudo wh [maintenance]" >&2
+                exit 1
+                ;;
+        esac
     fi
 
+    ensure_app_dirs
     main_menu
 }
 
