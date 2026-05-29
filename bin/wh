@@ -7,6 +7,7 @@ BACKUP_DIR="$APP_DIR/backups"
 CREDENTIALS_DIR="$APP_DIR/sites"
 CADDY_AVAILABLE="/etc/caddy/sites-available"
 CADDY_ENABLED="/etc/caddy/sites-enabled"
+LOGROTATE_CONFIG="/etc/logrotate.d/encodev-wh-cli"
 SFTP_GROUP="sftp-sites"
 SFTP_DENIED_REQUESTS="symlink,hardlink"
 SFTP_UMASK="027"
@@ -1260,6 +1261,8 @@ create_adminer_pool() {
     fi
 
     mkdir -p /var/log/wh-cli || return 1
+    chown root:"$user" /var/log/wh-cli || return 1
+    chmod 770 /var/log/wh-cli || return 1
     touch /var/log/wh-cli/adminer-php-error.log || return 1
     chown "$user:$user" /var/log/wh-cli/adminer-php-error.log || return 1
     chmod 640 /var/log/wh-cli/adminer-php-error.log || return 1
@@ -1350,8 +1353,46 @@ EOF
     enable_caddy_config "$conf"
 }
 
+configure_logrotate() {
+    write_file "$LOGROTATE_CONFIG" <<'EOF'
+# Managed by encodev-wh-cli
+/home/site_*/logs/access.log /home/site_*/logs/error.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su caddy caddy
+}
+
+/home/site_*/logs/php-error.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
+
+/var/log/wh-cli/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su wwwadminer wwwadminer
+}
+EOF
+}
+
 install_base_packages() {
-    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server iproute2
+    apt install -y caddy mariadb-server ufw curl wget unzip git openssl sudo acl openssh-server iproute2 logrotate
     systemctl enable caddy --now
 }
 
@@ -1437,6 +1478,7 @@ setup_server() {
     run_setup_step "Install PHP versions" install_php_versions
     run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
     run_setup_step "Configure Caddy base" configure_caddy_base
+    run_setup_step "Configure logrotate" configure_logrotate
     run_setup_step "Create SFTP group" groupadd -f "$SFTP_GROUP"
     run_setup_step "Configure UFW" configure_ufw "$admin_ip" "$ssh_port"
     run_setup_step "Configure SSH" configure_sshd "$admin_user"
@@ -1564,15 +1606,22 @@ create_site_user() {
     chown "$username:$username" "$home/tmp" || return 1
     chmod 700 "$home/tmp" || return 1
 
-    chown root:root "$home/logs" || return 1
-    chmod 751 "$home/logs" || return 1
+    prepare_log_directory "$home" || return 1
+}
+
+prepare_log_directory() {
+    local home=$1
+
+    require_caddy_user || return 1
+    chown root:caddy "$home/logs" || return 1
+    chmod 771 "$home/logs" || return 1
 }
 
 prepare_logs() {
     local username=$1
     local home=$2
 
-    require_caddy_user || return 1
+    prepare_log_directory "$home" || return 1
     touch "$home/logs/access.log" "$home/logs/error.log" "$home/logs/php-error.log" || return 1
     chown "caddy:$username" "$home/logs/access.log" "$home/logs/error.log" || return 1
     chown "$username:$username" "$home/logs/php-error.log" || return 1
@@ -1685,8 +1734,7 @@ fix_site_permissions() {
     chown "$username:$username" "$home/tmp" || return 1
     chmod 700 "$home/tmp" || return 1
 
-    chown root:root "$home/logs" || return 1
-    chmod 751 "$home/logs" || return 1
+    prepare_log_directory "$home" || return 1
     prepare_logs "$username" "$home"
 }
 
