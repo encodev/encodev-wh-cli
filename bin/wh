@@ -1142,6 +1142,48 @@ ssh_config_has_active_match() {
     return 1
 }
 
+strip_managed_block() {
+    local input=$1
+    local output=$2
+
+    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
+        $0 == begin {
+            if (skip) {
+                printf "Nested managed block begin marker at line %d.\n", NR > "/dev/stderr"
+                failed = 1
+                exit 2
+            }
+            skip = 1
+            begin_count++
+            next
+        }
+        $0 == end {
+            if (!skip) {
+                printf "Managed block end marker appears before begin marker at line %d.\n", NR > "/dev/stderr"
+                failed = 1
+                exit 2
+            }
+            skip = 0
+            end_count++
+            next
+        }
+        !skip { print }
+        END {
+            if (failed) {
+                exit 2
+            }
+            if (skip) {
+                printf "Managed block begin marker is missing a matching end marker.\n" > "/dev/stderr"
+                exit 2
+            }
+            if (begin_count != end_count) {
+                printf "Managed block markers are unbalanced: %d begin, %d end.\n", begin_count, end_count > "/dev/stderr"
+                exit 2
+            }
+        }
+    ' "$input" > "$output"
+}
+
 configure_sshd() {
     local admin_user=$1
     local config=/etc/ssh/sshd_config
@@ -1153,11 +1195,11 @@ configure_sshd() {
     backup_file "$config"
     tmp=$(mktemp)
 
-    awk -v begin="$MANAGED_BEGIN" -v end="$MANAGED_END" '
-        $0 == begin { skip = 1; next }
-        $0 == end { skip = 0; next }
-        !skip { print }
-    ' "$config" > "$tmp"
+    if ! strip_managed_block "$config" "$tmp"; then
+        echo "Refusing to rewrite SSH config with an invalid managed block." >&2
+        rm -f "$tmp"
+        return 1
+    fi
 
     if ssh_config_has_active_match "$tmp"; then
         echo "$config or an included SSH config contains an unmanaged Match block." >&2
