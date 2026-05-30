@@ -1781,6 +1781,28 @@ site_type_prompt() {
     esac
 }
 
+routing_profile_prompt() {
+    local type=$1
+    local choice
+
+    if [[ "$type" == "wordpress" ]]; then
+        printf '%s\n' "standard"
+        return 0
+    fi
+
+    echo >&2
+    echo "Routing:" >&2
+    echo "  1. Standard" >&2
+    echo "  2. SPA fallback to /index.html" >&2
+    printf 'Select routing [1]: ' >&2
+    read -r choice
+
+    case "${choice:-1}" in
+        2) printf '%s\n' "spa" ;;
+        *) printf '%s\n' "standard" ;;
+    esac
+}
+
 www_policy_prompt() {
     local domain=$1
     local choice
@@ -2195,9 +2217,11 @@ create_caddy_site() {
     local home=$4
     local php_version=$5
     local www_policy=${6:-none}
+    local routing=${7:-standard}
     local conf="$CADDY_AVAILABLE/$domain"
     local alias_block=""
     local site_address="$domain"
+    local fallback
     local managed_block
 
     if path_exists "$conf" || path_exists "$CADDY_ENABLED/$(basename "$conf")"; then
@@ -2236,15 +2260,35 @@ create_caddy_site() {
             ;;
     esac
 
-    if [[ "$type" == "static" ]]; then
+    case "$routing" in
+        standard|spa) ;;
+        *)
+            echo "Invalid routing profile: $routing" >&2
+            return 1
+            ;;
+    esac
+
+    if [[ "$routing" == "spa" ]]; then
+        fallback="/index.html"
+    else
+        fallback="/index.php?{query}"
+    fi
+
+    if [[ "$type" == "static" && "$routing" == "standard" ]]; then
         managed_block="    route {
         import encodev_security_static
+        file_server
+    }"
+    elif [[ "$type" == "static" ]]; then
+        managed_block="    route {
+        import encodev_security_static
+        try_files {path} {path}/ $fallback
         file_server
     }"
     else
         managed_block="    route {
         import encodev_security_php
-        try_files {path} {path}/ /index.php?{query}
+        try_files {path} {path}/ $fallback
         php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
         file_server
     }"
@@ -2257,6 +2301,7 @@ create_caddy_site() {
 # user: $username
 # php: ${php_version:--}
 # www: $www_policy
+# routing: $routing
 # webroot: $home/public_html
 
 $alias_block$site_address {
@@ -2288,10 +2333,11 @@ save_site_credentials() {
     local sftp_password=$5
     local php_version=$6
     local www_policy=$7
-    local wp_status=$8
-    local db_name=$9
-    local db_user=${10}
-    local db_pass=${11}
+    local routing=$8
+    local wp_status=$9
+    local db_name=${10}
+    local db_user=${11}
+    local db_pass=${12}
     local db_host="-"
     local file="$CREDENTIALS_DIR/$domain.txt"
     local old_umask
@@ -2313,6 +2359,7 @@ Web root: $home/public_html
 Logs: $home/logs
 PHP version: ${php_version:--}
 WWW policy: $(www_policy_label "$domain" "$www_policy")
+Routing: $routing
 WordPress files: $wp_status
 Caddy config: $CADDY_AVAILABLE/$domain
 Database host: $db_host
@@ -2356,7 +2403,7 @@ update_site_credentials_php_version() {
 add_site() {
     local domain type username default_username home php_version="-"
     local create_db="n" db_name="-" db_user="-" db_pass="-"
-    local sftp_password www_policy download_wp="n" wp_status="skipped"
+    local sftp_password www_policy routing download_wp="n" wp_status="skipped"
 
     ensure_app_dirs
 
@@ -2370,6 +2417,7 @@ add_site() {
 
     www_policy=$(www_policy_prompt "$domain")
     type=$(site_type_prompt)
+    routing=$(routing_profile_prompt "$type")
     default_username=$(username_from_domain "$domain")
     username=$(prompt "Site username" "$default_username")
     username=${username,,}
@@ -2413,6 +2461,7 @@ add_site() {
     echo "  Home:        $home"
     echo "  Web root:    $home/public_html"
     echo "  PHP:         $php_version"
+    echo "  Routing:     $routing"
     echo "  Database:    $create_db"
     echo "  WordPress:   $download_wp"
     echo "  WWW:         $(www_policy_label "$domain" "$www_policy")"
@@ -2439,7 +2488,7 @@ add_site() {
         rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
         return 1
     fi
-    if ! create_caddy_site "$domain" "$type" "$username" "$home" "$php_version" "$www_policy"; then
+    if ! create_caddy_site "$domain" "$type" "$username" "$home" "$php_version" "$www_policy" "$routing"; then
         echo "Failed to create Caddy config for $domain."
         rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
         return 1
@@ -2455,7 +2504,7 @@ add_site() {
         rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
         return 1
     fi
-    if ! save_site_credentials "$domain" "$type" "$username" "$home" "$sftp_password" "$php_version" "$www_policy" "$wp_status" "$db_name" "$db_user" "$db_pass"; then
+    if ! save_site_credentials "$domain" "$type" "$username" "$home" "$sftp_password" "$php_version" "$www_policy" "$routing" "$wp_status" "$db_name" "$db_user" "$db_pass"; then
         rollback_add_site "$domain" "$type" "$username" "$home" "$php_version" "$create_db" "$db_name" "$db_user"
         return 1
     fi
@@ -2479,6 +2528,7 @@ add_site() {
     echo "SFTP path: /public_html"
     echo "Web root: $home/public_html"
     echo "WWW: $(www_policy_label "$domain" "$www_policy")"
+    echo "Routing: $routing"
     [[ "$type" == "wordpress" ]] && echo "WordPress files: $wp_status"
     if [[ "$create_db" == "y" ]]; then
         echo "Database host: $DB_HOST"
@@ -2500,20 +2550,22 @@ site_files() {
 }
 
 list_sites() {
-    local file domain type user php webroot status
+    local file domain type routing user php webroot status
 
-    printf '%-28s %-10s %-9s %-32s %-6s %s\n' "Domain" "Type" "Status" "User" "PHP" "Web root"
-    printf '%-28s %-10s %-9s %-32s %-6s %s\n' "------" "----" "------" "----" "---" "--------"
+    printf '%-28s %-10s %-9s %-9s %-32s %-6s %s\n' "Domain" "Type" "Routing" "Status" "User" "PHP" "Web root"
+    printf '%-28s %-10s %-9s %-9s %-32s %-6s %s\n' "------" "----" "-------" "------" "----" "---" "--------"
 
     while IFS= read -r file; do
         domain=$(metadata_value domain "$file")
         type=$(metadata_value type "$file")
+        routing=$(metadata_value routing "$file")
+        [[ -z "$routing" ]] && routing="-"
         user=$(metadata_value user "$file")
         php=$(metadata_value php "$file")
         webroot=$(metadata_value webroot "$file")
         status="disabled"
         [[ -L "$CADDY_ENABLED/$(basename "$file")" ]] && status="enabled"
-        printf '%-28s %-10s %-9s %-32s %-6s %s\n' "$domain" "$type" "$status" "$user" "$php" "$webroot"
+        printf '%-28s %-10s %-9s %-9s %-32s %-6s %s\n' "$domain" "$type" "$routing" "$status" "$user" "$php" "$webroot"
     done < <(site_files)
 }
 
