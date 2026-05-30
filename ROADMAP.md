@@ -25,6 +25,9 @@ Possible future features for Encodev WH CLI.
 - Backup and restore a single site database.
 - Rotate a site database password.
 - Export database credentials from saved metadata.
+- Add an optional create/rotate workflow for a dedicated Adminer DBA user with
+  access to all databases, saving the generated credential under root-only
+  storage and making the elevated scope explicit.
 
 ## Site Operations
 
@@ -36,6 +39,7 @@ Possible future features for Encodev WH CLI.
   upload size changes such as `upload_max_filesize` and `post_max_size`.
 - Add an admin IP update workflow that safely updates the SSH UFW allow rule and
   managed Adminer Caddy `remote_ip` matcher without rerunning full setup.
+- Support IPv6 admin addresses for SSH and Adminer allowlists, not only IPv4.
 - Support optional per-site custom Caddy include files for routing rules that
   should stay outside CLI-managed blocks. The generated site config could import
   `/etc/caddy/sites-custom/<domain>.caddy` near the top of the site block, before
@@ -50,11 +54,21 @@ Possible future features for Encodev WH CLI.
 
 - Deeper Apache migration scan.
 - Detect exposed secrets in web roots.
+- Report archive and backup-like files in site web roots during scans, even
+  though managed Caddy security rules block public access to common archive
+  extensions.
 - Check for writable files and unsafe permissions.
 - Check WordPress upload paths for executable PHP files.
 - Support explicit per-site exceptions to managed security rules, such as
   documented PHP endpoint allowlists under upload/data paths, without editing the
   managed block directly.
+- Add an optional strict PHP-FPM hardening profile that can extend
+  `disable_functions` with high-compatibility-risk functions such as `putenv`,
+  `mail`, `mb_send_mail`, and `error_log`, with clear per-site compatibility
+  warnings.
+- Revisit the PHP-FPM `disable_functions` strategy and document whether the
+  project should keep per-pool `php_admin_value` enforcement or centralize common
+  restrictions in FPM-only `conf.d` files.
 - Add a validate-all-sites workflow that checks Caddy config validity, webroot
   existence, symlinks, PHP-FPM pools, enabled symlinks, and custom include files
   for every managed site.
