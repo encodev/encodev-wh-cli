@@ -39,6 +39,10 @@ Possible future features for Encodev WH CLI.
   `/etc/caddy/sites-custom/<domain>.caddy` near the top of the site block, before
   the CLI-managed fallback/PHP/static handling, while the CLI continues to own
   the main generated config and the managed security block.
+- Consider moving generated PHP front-controller fallback from a standalone
+  `try_files` directive into the `php_fastcgi { try_files ... }` subdirective,
+  aligning managed PHP site configs more closely with Caddy's native PHP-FPM
+  pattern while preserving legacy app routing behavior.
 
 ## Security And Scanning
 
