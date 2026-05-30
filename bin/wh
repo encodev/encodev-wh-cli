@@ -1915,6 +1915,10 @@ run_wp_cli_for_site() {
     runuser -u "$username" -- env HOME="$wp_home" WP_CLI_CACHE_DIR="$wp_cache" wp --path="$webroot" "$@"
 }
 
+sanitize_terminal_output() {
+    LC_ALL=C sed -E $'s/\x1B\\[[0-?]*[ -/]*[@-~]//g; s/\x1B\\][^\a]*(\a|\x1B\\\\)//g' | cat -v
+}
+
 wp_cli_probe_works() {
     local username=$1
     local home=$2
@@ -1943,10 +1947,10 @@ run_wp_cli_site_checks() {
         return 0
     fi
 
-    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" core version 2>/dev/null || true
-    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get siteurl 2>/dev/null || true
-    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get home 2>/dev/null || true
-    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" plugin list --status=active 2>/dev/null || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" core version 2>/dev/null | sanitize_terminal_output || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get siteurl 2>/dev/null | sanitize_terminal_output || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" option get home 2>/dev/null | sanitize_terminal_output || true
+    run_wp_cli_for_site "$username" "$home" "$webroot" "${wp_args[@]}" plugin list --status=active 2>/dev/null | sanitize_terminal_output || true
 }
 
 fix_site_permissions() {
