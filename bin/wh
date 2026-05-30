@@ -7,6 +7,7 @@ BACKUP_DIR="$APP_DIR/backups"
 CREDENTIALS_DIR="$APP_DIR/sites"
 CADDY_AVAILABLE="/etc/caddy/sites-available"
 CADDY_ENABLED="/etc/caddy/sites-enabled"
+CADDY_SNIPPETS="/etc/caddy/encodev-wh-cli-snippets"
 LOGROTATE_CONFIG="/etc/logrotate.d/encodev-wh-cli"
 MAINTENANCE_CRON_CONFIG="/etc/cron.d/encodev-wh-cli-maintenance"
 MAINTENANCE_RETENTION_DAYS=7
@@ -32,13 +33,21 @@ WP_CLI_TAG="v${WP_CLI_VERSION}"
 WP_CLI_ASSET="wp-cli-${WP_CLI_VERSION}.phar"
 WP_CLI_URL="https://github.com/${WP_CLI_REPO}/releases/download/${WP_CLI_TAG}/${WP_CLI_ASSET}"
 WP_CLI_ASSET_SHA256="ce34ddd838f7351d6759068d09793f26755463b4a4610a5a5c0a97b68220d85c"
+CADDY_MIN_VERSION="2.11.3"
+CADDY_STABLE_APT_KEY_URL="https://dl.cloudsmith.io/public/caddy/stable/gpg.155B6D79CA56EA34.key"
+CADDY_STABLE_APT_KEYRING="/usr/share/keyrings/caddy-stable-archive-keyring.gpg"
+CADDY_STABLE_APT_SOURCE="/etc/apt/sources.list.d/caddy-stable.list"
+CADDY_STABLE_APT_FINGERPRINT="65760C51EDEA2017CEA2CA15155B6D79CA56EA34"
+CADDY_STABLE_APT_URI="https://dl.cloudsmith.io/public/caddy/stable/deb/debian"
 SURY_APT_KEY_FINGERPRINT="15058500A0235D97F5D10063B188E2B695BD4743"
 MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
 MANAGED_END="# END encodev-wh-cli managed"
 DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
 PHP_EXTENSIONS=(cli mysql curl mbstring xml zip gd intl bcmath soap imagick opcache)
 PHP_EOL_VERSIONS=(8.1 8.0 7.4 7.3 7.2 7.1 7.0 5.6)
-SENSITIVE_PATH_REGEXP='(?i)(?:(^|/)(?:\.git|\.svn|\.hg)(?:/|$)|(^|/)(?:\.env[^/]*|\.htaccess|\.htpasswd|\.user\.ini|wp-config\.php|composer\.(?:json|lock)|auth\.json|package(?:-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$|\.(?:sql|sqlite3?|db|bak|backup|old|orig|save|sw[op]|tmp)$)'
+HIDDEN_PATH_REGEXP='(?i)(^|/)\.[^/]+(?:/|$)'
+HIDDEN_WELL_KNOWN_PATH_REGEXP='(?i)^/\.well-known/(?:.*/)?\.[^/]+(?:/|$)'
+SENSITIVE_PATH_REGEXP='(?i)(?:(^|/)(?:\.env[^/]*|\.htaccess|\.htpasswd|\.user\.ini|wp-config\.php|composer\.(?:json|lock)|auth\.json|package(?:-lock)?\.json|yarn\.lock|pnpm-lock\.yaml)$|\.(?:sql|sqlite3?|db|bak|backup|old|orig|save|sw[op]|tmp|zip|tar|tgz|gz|bz2|xz|tar\.gz|tar\.bz2|tar\.xz|rar|7z)$)'
 STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 PHP_STATIC_EXECUTABLE_REGEXP='(?i)\.(?:php[0-9]+|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
 UPLOAD_EXECUTABLE_REGEXP='(?i)^/(?:wp-content/uploads|uploads|data|cache)/.*\.(?:php[0-9]?|phtml|phar|phps|cgi|pl|py|rb|sh|bash|zsh|ksh)$'
@@ -123,6 +132,33 @@ validate_port() {
 validate_php_version() {
     local version=$1
     [[ "$version" =~ ^[0-9]+[.][0-9]+$ ]]
+}
+
+parse_semver_triplet() {
+    local version=${1#v}
+
+    version=${version%%[[:space:]]*}
+    [[ "$version" =~ ^([0-9]+)[.]([0-9]+)[.]([0-9]+) ]] || return 1
+    printf '%s %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+}
+
+semver_at_least() {
+    local version=$1
+    local minimum=$2
+    local parsed minimum_parsed
+    local major minor patch minimum_major minimum_minor minimum_patch
+
+    parsed=$(parse_semver_triplet "$version") || return 1
+    minimum_parsed=$(parse_semver_triplet "$minimum") || return 1
+
+    read -r major minor patch <<< "$parsed"
+    read -r minimum_major minimum_minor minimum_patch <<< "$minimum_parsed"
+
+    (( major > minimum_major )) && return 0
+    (( major < minimum_major )) && return 1
+    (( minor > minimum_minor )) && return 0
+    (( minor < minimum_minor )) && return 1
+    (( patch >= minimum_patch ))
 }
 
 validate_domain() {
@@ -707,6 +743,33 @@ ensure_apt_keyring() {
     install_apt_keyring "$url" "$dest" "$expected_fingerprint"
 }
 
+caddy_installed_version() {
+    local output version
+
+    output=$(caddy version 2>/dev/null) || return 1
+    version=${output%%[[:space:]]*}
+    version=${version#v}
+
+    parse_semver_triplet "$version" >/dev/null || return 1
+    printf '%s\n' "$version"
+}
+
+require_caddy_minimum_version() {
+    local version
+
+    require_command caddy || return 1
+    version=$(caddy_installed_version) || {
+        echo "Could not parse installed Caddy version." >&2
+        return 1
+    }
+
+    if ! semver_at_least "$version" "$CADDY_MIN_VERSION"; then
+        echo "Caddy $version is installed, but encodev-wh-cli requires Caddy $CADDY_MIN_VERSION or newer." >&2
+        echo "Check that the official Caddy stable APT repository is configured and preferred." >&2
+        return 1
+    fi
+}
+
 php_socket_ref() {
     local php_version=$1
     local username=$2
@@ -720,6 +783,15 @@ php_socket_ref() {
         return 1
     }
     printf 'unix//run/php/php%s-fpm-%s.sock\n' "$php_version" "$username"
+}
+
+format_caddy_file() {
+    local file=$1
+
+    if ! caddy fmt --overwrite "$file"; then
+        echo "Failed to format Caddy config: $file" >&2
+        return 1
+    fi
 }
 
 enable_caddy_config() {
@@ -987,7 +1059,16 @@ prepare_repositories() {
     codename=$(awk -F= '$1 == "VERSION_CODENAME" { gsub(/"/, "", $2); print $2 }' /etc/os-release)
 
     apt update
-    apt install -y ca-certificates curl gnupg apt-transport-https
+    apt install -y ca-certificates curl gnupg apt-transport-https debian-keyring debian-archive-keyring
+
+    ensure_apt_keyring \
+        "$CADDY_STABLE_APT_KEY_URL" \
+        "$CADDY_STABLE_APT_KEYRING" \
+        "$CADDY_STABLE_APT_FINGERPRINT"
+
+    write_file "$CADDY_STABLE_APT_SOURCE" <<EOF
+deb [signed-by=$CADDY_STABLE_APT_KEYRING] $CADDY_STABLE_APT_URI any-version main
+EOF
 
     ensure_apt_keyring \
         https://packages.sury.org/php/apt.gpg \
@@ -1025,10 +1106,98 @@ configure_caddy_base() {
         echo "Refusing to overwrite it. Move it aside or migrate it manually." >&2
         return 1
     fi
+    configure_caddy_snippets || return 1
     write_file /etc/caddy/Caddyfile <<EOF
 # Managed by encodev-wh-cli
+import $CADDY_SNIPPETS
 import $CADDY_ENABLED/*
 EOF
+    format_caddy_file /etc/caddy/Caddyfile
+}
+
+configure_caddy_snippets() {
+    mkdir -p /etc/caddy
+    if path_exists "$CADDY_SNIPPETS" && ! is_managed_file "$CADDY_SNIPPETS"; then
+        echo "$CADDY_SNIPPETS exists and is not managed by encodev-wh-cli." >&2
+        echo "Refusing to overwrite it. Move it aside or migrate it manually." >&2
+        return 1
+    fi
+
+    write_file "$CADDY_SNIPPETS" <<EOF
+# Managed by encodev-wh-cli
+
+(encodev_security_static) {
+    @hidden_well_known_paths {
+        path_regexp hidden_well_known_paths $HIDDEN_WELL_KNOWN_PATH_REGEXP
+        {blocks.hidden_well_known_paths_except}
+    }
+    handle @hidden_well_known_paths {
+        respond "Not Found" 404
+    }
+    @hidden_paths {
+        not path /.well-known /.well-known/*
+        path_regexp hidden_paths $HIDDEN_PATH_REGEXP
+        {blocks.hidden_paths_except}
+    }
+    handle @hidden_paths {
+        respond "Not Found" 404
+    }
+    @sensitive_paths {
+        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
+        {blocks.sensitive_paths_except}
+    }
+    handle @sensitive_paths {
+        respond "Not Found" 404
+    }
+    @executable_static_files {
+        path_regexp executable_static_files $STATIC_EXECUTABLE_REGEXP
+        {blocks.executable_static_files_except}
+    }
+    handle @executable_static_files {
+        respond "Not Found" 404
+    }
+}
+
+(encodev_security_php) {
+    @hidden_well_known_paths {
+        path_regexp hidden_well_known_paths $HIDDEN_WELL_KNOWN_PATH_REGEXP
+        {blocks.hidden_well_known_paths_except}
+    }
+    handle @hidden_well_known_paths {
+        respond "Not Found" 404
+    }
+    @hidden_paths {
+        not path /.well-known /.well-known/*
+        path_regexp hidden_paths $HIDDEN_PATH_REGEXP
+        {blocks.hidden_paths_except}
+    }
+    handle @hidden_paths {
+        respond "Not Found" 404
+    }
+    @sensitive_paths {
+        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
+        {blocks.sensitive_paths_except}
+    }
+    handle @sensitive_paths {
+        respond "Not Found" 404
+    }
+    @blocked_upload_executables {
+        path_regexp blocked_upload_executables $UPLOAD_EXECUTABLE_REGEXP
+        {blocks.blocked_upload_executables_except}
+    }
+    handle @blocked_upload_executables {
+        respond "Forbidden" 403
+    }
+    @executable_static_files {
+        path_regexp executable_static_files $PHP_STATIC_EXECUTABLE_REGEXP
+        {blocks.executable_static_files_except}
+    }
+    handle @executable_static_files {
+        respond "Not Found" 404
+    }
+}
+EOF
+    format_caddy_file "$CADDY_SNIPPETS"
 }
 
 configure_timezone_and_locales() {
@@ -1395,6 +1564,8 @@ $admin_host {
 }
 EOF
 
+    format_caddy_file "$conf" || return 1
+
     enable_caddy_config "$conf"
 }
 
@@ -1507,7 +1678,7 @@ setup_server() {
     echo "  Default locale:  $DEFAULT_LOCALE"
     echo "  PHP versions:    choose after repositories are prepared"
     echo "  MariaDB:         install and harden with root socket auth"
-    echo "  Caddy:           install Debian package and use sites-enabled imports"
+    echo "  Caddy:           install official stable package >= $CADDY_MIN_VERSION and use snippets/sites-enabled imports"
     echo "  UFW:             SSH port $ssh_port from $admin_ip only, public 80/443"
     echo "  Fail2ban:        SSH jail"
     echo "  Adminer:         https://$admin_host/dba, IP restricted"
@@ -1531,6 +1702,7 @@ setup_server() {
     primary_php=${SELECTED_PHP_VERSIONS[0]}
 
     run_setup_step "Install base packages" install_base_packages
+    run_setup_step "Verify Caddy version" require_caddy_minimum_version
     run_setup_step "Install PHP versions" install_php_versions
     run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
     run_setup_step "Configure Caddy base" configure_caddy_base
@@ -2055,35 +2227,17 @@ create_caddy_site() {
     esac
 
     if [[ "$type" == "static" ]]; then
-        managed_block="    $MANAGED_BEGIN
-    @sensitive_paths {
-        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
-    }
-    respond @sensitive_paths \"Not Found\" 404
-    @executable_static_files {
-        path_regexp executable_static_files $STATIC_EXECUTABLE_REGEXP
-    }
-    respond @executable_static_files \"Not Found\" 404
-    file_server
-    $MANAGED_END"
+        managed_block="    route {
+        import encodev_security_static
+        file_server
+    }"
     else
-        managed_block="    $MANAGED_BEGIN
-    @sensitive_paths {
-        path_regexp sensitive_paths $SENSITIVE_PATH_REGEXP
-    }
-    respond @sensitive_paths \"Not Found\" 404
-    @blocked_upload_executables {
-        path_regexp blocked_upload_executables $UPLOAD_EXECUTABLE_REGEXP
-    }
-    respond @blocked_upload_executables \"Forbidden\" 403
-    @executable_static_files {
-        path_regexp executable_static_files $PHP_STATIC_EXECUTABLE_REGEXP
-    }
-    respond @executable_static_files \"Not Found\" 404
-    try_files {path} {path}/ /index.php?{query}
-    php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
-    file_server
-    $MANAGED_END"
+        managed_block="    route {
+        import encodev_security_php
+        try_files {path} {path}/ /index.php?{query}
+        php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
+        file_server
+    }"
     fi
 
     write_file "$conf" <<EOF
@@ -2113,6 +2267,7 @@ $managed_block
 }
 EOF
 
+    format_caddy_file "$conf"
 }
 
 save_site_credentials() {
