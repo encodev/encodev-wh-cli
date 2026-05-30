@@ -34,6 +34,8 @@ Possible future features for Encodev WH CLI.
 - Remove a site with clear confirmation and backups.
 - Add a per-site PHP settings workflow for managed PHP-FPM pools, including
   upload size changes such as `upload_max_filesize` and `post_max_size`.
+- Add an admin IP update workflow that safely updates the SSH UFW allow rule and
+  managed Adminer Caddy `remote_ip` matcher without rerunning full setup.
 - Support optional per-site custom Caddy include files for routing rules that
   should stay outside CLI-managed blocks. The generated site config could import
   `/etc/caddy/sites-custom/<domain>.caddy` near the top of the site block, before
