@@ -1,80 +1,45 @@
 # Encodev WH CLI Roadmap
 
-Possible future features for Encodev WH CLI.
+Priority-ordered future work for Encodev WH CLI.
 
-## Site Migration
+## P0 - Security And Operational Safety
 
-- Change the domain or subdomain for an existing site.
-- Update the managed Caddy config and enabled symlink.
-- Update saved credentials metadata.
-- Optionally update WordPress `siteurl` and `home` with WP-CLI.
-- Optionally add redirects from the old host to the new host.
-- Document common `.htaccess` to Caddy migration patterns, including WordPress
-  rewrites, SPA fallbacks, language redirects, static fallback routing, and
-  legacy host redirects.
+1. Make setup safe to rerun for installs, updates, repairs, and admin allowlist changes.
+2. Validate all managed sites.
+3. Scan sites for exposed files and malware indicators.
+4. Review PHP-FPM function restrictions.
+5. Add an optional strict PHP-FPM hardening profile.
+6. Support IPv6 admin allowlists.
 
-## WordPress Helpers
+## P1 - Recovery And Site Maintenance
 
-- Create `wp-config.php` from generated database credentials.
-- Run optional `wp core install`.
-- Check plugin, theme, and core update status.
-- Repair common WordPress file permissions.
+1. Repair site permissions.
+2. Back up and restore site files.
+3. Back up and restore site databases.
+4. Roll back failed operations.
+5. Rotate database passwords.
+6. Rotate SFTP passwords.
+7. Remove sites safely.
+8. Manage per-site PHP settings.
+9. Export saved database credentials.
+10. Manage dedicated Adminer DBA credentials.
 
-## Database Operations
+## P2 - WordPress And Migration
 
-- Backup and restore a single site database.
-- Rotate a site database password.
-- Export database credentials from saved metadata.
-- Add an optional create/rotate workflow for a dedicated Adminer DBA user with
-  access to all databases, saving the generated credential under root-only
-  storage and making the elevated scope explicit.
+1. Generate `wp-config.php` from saved credentials.
+2. Run optional WordPress core installs.
+3. Check WordPress update status.
+4. Repair WordPress file permissions.
+5. Improve Apache migration scanning.
+6. Rename site domains.
+7. Update WordPress URLs during renames.
+8. Add redirects during renames.
+9. Clone sites.
+10. Document `.htaccess` to Caddy migration patterns.
 
-## Site Operations
+## P3 - Routing, Customization, And Automation
 
-- Repair permissions for an existing site.
-- Rotate SFTP password.
-- Clone an existing site to a new domain.
-- Remove a site with clear confirmation and backups.
-- Add a per-site PHP settings workflow for managed PHP-FPM pools, including
-  upload size changes such as `upload_max_filesize` and `post_max_size`.
-- Add an admin IP update workflow that safely updates the SSH UFW allow rule and
-  managed Adminer Caddy `remote_ip` matcher without rerunning full setup.
-- Support IPv6 admin addresses for SSH and Adminer allowlists, not only IPv4.
-- Support optional per-site custom Caddy include files for routing rules that
-  should stay outside CLI-managed blocks. The generated site config could import
-  `/etc/caddy/sites-custom/<domain>.caddy` near the top of the site block, before
-  the CLI-managed fallback/PHP/static handling, while the CLI continues to own
-  the main generated config and the managed security block.
-- Consider moving generated PHP front-controller fallback from a standalone
-  `try_files` directive into the `php_fastcgi { try_files ... }` subdirective,
-  aligning managed PHP site configs more closely with Caddy's native PHP-FPM
-  pattern while preserving legacy app routing behavior.
-
-## Security And Scanning
-
-- Deeper Apache migration scan.
-- Detect exposed secrets in web roots.
-- Report archive and backup-like files in site web roots during scans, even
-  though managed Caddy security rules block public access to common archive
-  extensions.
-- Check for writable files and unsafe permissions.
-- Check WordPress upload paths for executable PHP files.
-- Support explicit per-site exceptions to managed security rules, such as
-  documented PHP endpoint allowlists under upload/data paths, without editing the
-  managed block directly.
-- Add an optional strict PHP-FPM hardening profile that can extend
-  `disable_functions` with high-compatibility-risk functions such as `putenv`,
-  `mail`, `mb_send_mail`, and `error_log`, with clear per-site compatibility
-  warnings.
-- Revisit the PHP-FPM `disable_functions` strategy and document whether the
-  project should keep per-pool `php_admin_value` enforcement or centralize common
-  restrictions in FPM-only `conf.d` files.
-- Add a validate-all-sites workflow that checks Caddy config validity, webroot
-  existence, symlinks, PHP-FPM pools, enabled symlinks, and custom include files
-  for every managed site.
-
-## Automation
-
-- Add non-interactive flags after the interactive flow is stable.
-- Support dry-run summaries.
-- Export machine-readable status output.
+1. Export machine-readable status output.
+2. Organize the interactive menu by workflow.
+3. Support dry-run summaries.
+4. Add non-interactive flags.
