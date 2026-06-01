@@ -43,6 +43,7 @@ SURY_APT_KEY_FINGERPRINT="15058500A0235D97F5D10063B188E2B695BD4743"
 MANAGED_BEGIN="# BEGIN encodev-wh-cli managed"
 MANAGED_END="# END encodev-wh-cli managed"
 DISABLED_PHP_FUNCTIONS="exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,curl_multi_exec,parse_ini_file,show_source"
+PHP_DEFAULTS_INI="99-encodev-wh-cli.ini"
 PHP_FPM_MAX_CHILDREN=3
 PHP_FPM_PROCESS_IDLE_TIMEOUT="10s"
 PHP_UPLOAD_MAX_FILESIZE="64M"
@@ -232,6 +233,38 @@ validate_timezone() {
         return 0
     fi
     [[ "$1" != *".."* && -f "/usr/share/zoneinfo/$1" ]]
+}
+
+detect_system_timezone() {
+    local timezone
+
+    if command_exists timedatectl; then
+        timezone=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+        if [[ -n "$timezone" ]] && validate_timezone "$timezone"; then
+            printf '%s\n' "$timezone"
+            return 0
+        fi
+    fi
+
+    if [[ -r /etc/timezone ]]; then
+        timezone=$(awk 'NF { print $1; exit }' /etc/timezone 2>/dev/null || true)
+        if [[ -n "$timezone" ]] && validate_timezone "$timezone"; then
+            printf '%s\n' "$timezone"
+            return 0
+        fi
+    fi
+
+    if [[ -L /etc/localtime ]]; then
+        timezone=$(readlink /etc/localtime 2>/dev/null || true)
+        timezone=${timezone#/usr/share/zoneinfo/}
+        if [[ -n "$timezone" ]] && validate_timezone "$timezone"; then
+            printf '%s\n' "$timezone"
+            return 0
+        fi
+    fi
+
+    echo "Could not detect a valid system timezone." >&2
+    return 1
 }
 
 detect_hostname() {
@@ -461,6 +494,22 @@ is_managed_file() {
 is_managed_php_pool() {
     local path=$1
     [[ -f "$path" ]] && grep -q '^; Managed by encodev-wh-cli' "$path"
+}
+
+is_managed_php_config() {
+    local path=$1
+    [[ -f "$path" ]] && grep -q '^; Managed by encodev-wh-cli' "$path"
+}
+
+require_managed_php_config_or_missing() {
+    local path=$1
+    local label=$2
+
+    if path_exists "$path" && ! is_managed_php_config "$path"; then
+        echo "$label exists and is not managed by encodev-wh-cli: $path" >&2
+        echo "Refusing to overwrite it. Move it aside or add it manually." >&2
+        return 1
+    fi
 }
 
 require_managed_php_pool_or_missing() {
@@ -1088,8 +1137,65 @@ EOF
     apt update
 }
 
+configure_php_defaults_for_version() {
+    local version=${1:-}
+    local timezone=${2:-}
+    local fpm_ini="/etc/php/$version/fpm/conf.d/$PHP_DEFAULTS_INI"
+    local cli_ini="/etc/php/$version/cli/conf.d/$PHP_DEFAULTS_INI"
+
+    validate_php_version "$version" || {
+        echo "Invalid PHP version: $version" >&2
+        return 1
+    }
+    validate_timezone "$timezone" || {
+        echo "Invalid timezone for PHP defaults: $timezone" >&2
+        return 1
+    }
+    if [[ ! -d "/etc/php/$version/fpm/conf.d" ]]; then
+        echo "Missing PHP-FPM config directory for PHP $version." >&2
+        return 1
+    fi
+    if [[ ! -d "/etc/php/$version/cli/conf.d" ]]; then
+        echo "Missing PHP CLI config directory for PHP $version." >&2
+        return 1
+    fi
+
+    require_managed_php_config_or_missing "$fpm_ini" "PHP-FPM defaults file" || return 1
+    require_managed_php_config_or_missing "$cli_ini" "PHP CLI defaults file" || return 1
+
+    write_file "$fpm_ini" <<EOF
+; Managed by encodev-wh-cli
+date.timezone = $timezone
+EOF
+
+    write_file "$cli_ini" <<EOF
+; Managed by encodev-wh-cli
+date.timezone = $timezone
+EOF
+}
+
+configure_php_defaults() {
+    local timezone=${1:-}
+    local version
+    shift || true
+
+    validate_timezone "$timezone" || {
+        echo "Invalid timezone for PHP defaults: $timezone" >&2
+        return 1
+    }
+    for version in "$@"; do
+        configure_php_defaults_for_version "$version" "$timezone" || return 1
+    done
+}
+
 install_php_versions() {
+    local timezone=${1:-}
     local version packages=() version_packages=()
+
+    validate_timezone "$timezone" || {
+        echo "Invalid timezone for PHP defaults: $timezone" >&2
+        return 1
+    }
 
     for version in "${SELECTED_PHP_VERSIONS[@]}"; do
         php_version_packages_available "$version" "y" || return 1
@@ -1098,8 +1204,10 @@ install_php_versions() {
     done
 
     apt install -y "${packages[@]}"
+    configure_php_defaults "$timezone" "${SELECTED_PHP_VERSIONS[@]}"
     for version in "${SELECTED_PHP_VERSIONS[@]}"; do
         systemctl enable "php$version-fpm" --now
+        systemctl restart "php$version-fpm"
     done
 }
 
@@ -1709,7 +1817,7 @@ setup_server() {
 
     run_setup_step "Install base packages" install_base_packages
     run_setup_step "Verify Caddy version" require_caddy_minimum_version
-    run_setup_step "Install PHP versions" install_php_versions
+    run_setup_step "Install PHP versions" install_php_versions "$timezone"
     run_setup_step "Configure timezone and locales" configure_timezone_and_locales "$timezone"
     run_setup_step "Configure Caddy base" configure_caddy_base
     run_setup_step "Configure logrotate" configure_logrotate
@@ -1736,6 +1844,8 @@ setup_server() {
 }
 
 install_php_versions_menu() {
+    local timezone
+
     ensure_app_dirs
     assert_supported_os || return 1
     require_command apt || return 1
@@ -1753,14 +1863,16 @@ install_php_versions_menu() {
     if ! confirm "Continue?" "y"; then
         return 0
     fi
+    timezone=$(detect_system_timezone) || return 1
 
     start_backup_run
     prepare_repositories
     select_php_versions_to_install
-    install_php_versions
+    install_php_versions "$timezone"
     prune_backups
 
     echo "Installed PHP versions: ${SELECTED_PHP_VERSIONS[*]}"
+    echo "PHP timezone: $timezone"
     echo "Backup: $CURRENT_BACKUP_DIR"
 }
 
