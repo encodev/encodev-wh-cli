@@ -7,9 +7,10 @@ Priority-ordered future work for Encodev WH CLI.
 1. Make setup safe to rerun for installs, updates, repairs, and admin allowlist changes.
 2. Validate all managed sites.
 3. Scan sites for exposed files and malware indicators.
-4. Review PHP-FPM function restrictions.
-5. Add an optional strict PHP-FPM hardening profile.
-6. Support IPv6 admin allowlists.
+4. Add email alerts for critical security and operational findings.
+5. Review PHP-FPM function restrictions.
+6. Add an optional strict PHP-FPM hardening profile.
+7. Support IPv6 admin allowlists.
 
 ## P1 - Recovery And Site Maintenance
 
