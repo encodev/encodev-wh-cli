@@ -1972,8 +1972,8 @@ create_site_user() {
     chmod 751 "$home" || return 1
     chown "$username:caddy" "$home/public_html" || return 1
     chmod 2750 "$home/public_html" || return 1
-    chown "$username:$username" "$home/tmp" || return 1
-    chmod 700 "$home/tmp" || return 1
+    chown "$username:caddy" "$home/tmp" || return 1
+    chmod 2700 "$home/tmp" || return 1
 
     prepare_log_directory "$home" || return 1
 }
@@ -2033,9 +2033,10 @@ prepare_wp_cli_runtime() {
 
     [[ "$home" == "/home/$username" ]] || return 1
     mkdir -p "$wp_cache" || return 1
-    chown "$username:$username" "$wp_home" || return 1
+    chown "$username:caddy" "$wp_home" || return 1
     chown -R "$username:$username" "$wp_cache" || return 1
-    chmod 700 "$wp_home" "$wp_cache" || return 1
+    chmod 2700 "$wp_home" || return 1
+    chmod 700 "$wp_cache" || return 1
 }
 
 run_wp_cli_for_site() {
@@ -2104,8 +2105,8 @@ fix_site_permissions() {
     find "$webroot" -type d -exec chmod 2750 {} + || return 1
     find "$webroot" -type f -exec chmod 640 {} + || return 1
 
-    chown "$username:$username" "$home/tmp" || return 1
-    chmod 700 "$home/tmp" || return 1
+    chown "$username:caddy" "$home/tmp" || return 1
+    chmod 2700 "$home/tmp" || return 1
 
     prepare_log_directory "$home" || return 1
     prepare_logs "$username" "$home"
