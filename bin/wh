@@ -2398,6 +2398,13 @@ create_caddy_site() {
         try_files {path} {path}/ $fallback
         file_server
     }"
+    elif [[ "$type" == "wordpress" && "$routing" == "standard" ]]; then
+        # Let php_fastcgi redirect PHP directories before rewriting to index.php.
+        managed_block="    route {
+        import encodev_security_php
+        php_fastcgi unix//run/php/php$php_version-fpm-$username.sock
+        file_server
+    }"
     else
         managed_block="    route {
         import encodev_security_php
